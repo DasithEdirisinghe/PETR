@@ -1,0 +1,30 @@
+#!/bin/bash -l
+#PBS -N petr_pccr_r1_A100
+#PBS -l select=1:ncpus=24:ngpus=2:mem=80GB:gpu_id=A100
+#PBS -l walltime=48:00:00
+#PBS -m abe
+#PBS -j oe
+
+set -eo pipefail
+
+# Activate the PETR environment.
+conda activate petr
+
+# Relative dataset and checkpoint paths in the config are resolved from here.
+PETR_DIR=/mnt/hpccs01/home/n12893251/dasith_ws/dev_ws/PETR
+cd "$PETR_DIR"
+export PYTHONPATH="$PETR_DIR:${PYTHONPATH:-}"
+
+CONFIG=projects/configs/petr/petr_r50dcn_gridmask_p4_800x320_pccr.py
+OUTPUT_DIR=results/petr_r50dcn_gridmask_p4_800x320_pccr/R1
+
+# Basic job diagnostics recorded in the PBS output log.
+echo "PBS job: ${PBS_JOBID:-unknown}"
+echo "Host: $(hostname)"
+echo "Working directory: $(pwd)"
+nvidia-smi
+
+# Single-node distributed training on the two allocated A100 GPUs.
+bash tools/dist_train.sh "$CONFIG" 2 \
+    --work-dir "$OUTPUT_DIR" \
+    --seed 0

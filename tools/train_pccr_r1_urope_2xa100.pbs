@@ -1,0 +1,26 @@
+#!/bin/bash -l
+#PBS -N petr_urope_pccr_r1_A100
+#PBS -l select=1:ncpus=24:ngpus=2:mem=80GB:gpu_id=A100
+#PBS -l walltime=48:00:00
+#PBS -m abe
+#PBS -j oe
+
+set -eo pipefail
+
+conda activate petr
+
+PETR_DIR=/mnt/hpccs01/home/n12893251/dasith_ws/dev_ws/PETR
+cd "$PETR_DIR"
+export PYTHONPATH="$PETR_DIR:${PYTHONPATH:-}"
+
+CONFIG=projects/configs/petr/petr_r50dcn_gridmask_p4_800x320_pccr_urope.py
+OUTPUT_DIR=results/petr_r50dcn_gridmask_p4_800x320_pccr_urope/R1
+
+echo "PBS job: ${PBS_JOBID:-unknown}"
+echo "Host: $(hostname)"
+echo "Working directory: $(pwd)"
+nvidia-smi
+
+bash tools/dist_train.sh "$CONFIG" 2 \
+    --work-dir "$OUTPUT_DIR" \
+    --seed 0

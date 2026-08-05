@@ -1,0 +1,43 @@
+#!/bin/bash -l
+#PBS -N petr_eval_R1
+#PBS -l select=1:ncpus=12:ngpus=1:mem=48GB:gpu_id=A100
+#PBS -l walltime=04:00:00
+#PBS -m abe
+#PBS -j oe
+
+set -eo pipefail
+
+conda activate petr
+
+PETR_DIR=/mnt/hpccs01/home/n12893251/dasith_ws/dev_ws/PETR
+cd "$PETR_DIR"
+
+export PYTHONPATH="$PETR_DIR:${PYTHONPATH:-}"
+
+CONFIG=projects/configs/petr/petr_r50dcn_gridmask_p4_800x320_pccr.py
+CHECKPOINT=results/petr_r50dcn_gridmask_p4_800x320_pccr/R1/epoch_120.pth
+DATASET_PATH=data/pccr/R1
+EVAL_DIR=results/petr_r50dcn_gridmask_p4_800x320_pccr/R1/eval_R1
+
+test -f "$CHECKPOINT"
+test -f "$DATASET_PATH/R1_infos_test.pkl"
+
+mkdir -p "$EVAL_DIR"
+
+PORT=29501 bash tools/dist_test.sh \
+    "$CONFIG" \
+    "$CHECKPOINT" \
+    1 \
+    --cfg-options \
+        dataset_name=R1 \
+        data_root="$DATASET_PATH/" \
+        test_ann_file="$DATASET_PATH/R1_infos_test.pkl" \
+        data.test.data_root="$DATASET_PATH/" \
+        data.test.ann_file="$DATASET_PATH/R1_infos_test.pkl" \
+        data.samples_per_gpu=4 \
+        data.workers_per_gpu=4 \
+    --out "$EVAL_DIR/predictions.pkl" \
+    --eval bbox \
+    --eval-options \
+        jsonfile_prefix="$EVAL_DIR/formatted" \
+    2>&1 | tee "$EVAL_DIR/eval.log"

@@ -26,6 +26,7 @@ import numpy as np
 from mmcv.cnn import xavier_init, constant_init, kaiming_init
 import math
 from mmdet.models.utils import NormedLinear
+from projects.mmdet3d_plugin.models.utils.urope import build_urope_3d_positions
 def pos2posemb3d(pos, num_pos_feats=128, temperature=10000):
     scale = 2 * math.pi
     pos = pos * scale
@@ -109,6 +110,8 @@ class PETRHead(AnchorFreeHead):
                  position_range=[-65, -65, -8.0, 65, 65, 8.0],
                  init_cfg=None,
                  normedlinear=False,
+                 position_embedding_mode='petr',
+                 urope_cfg=None,
                  **kwargs):
         # NOTE here use `AnchorFreeHead` instead of `TransformerHead`,
         # since it brings inconvenience when the initialization of
@@ -178,6 +181,14 @@ class PETRHead(AnchorFreeHead):
         self.position_level = 0
         self.with_position = with_position
         self.with_multiview = with_multiview
+        if position_embedding_mode not in ('petr', 'urope', 'hybrid'):
+            raise ValueError('position_embedding_mode must be petr, urope, or hybrid')
+        self.position_embedding_mode = position_embedding_mode
+        self.with_urope = position_embedding_mode in ('urope', 'hybrid')
+        self.urope_cfg = dict(urope_cfg or {})
+        if position_embedding_mode == 'hybrid' and not with_position:
+            raise ValueError(
+                'hybrid mode requires with_position=True to retain PETR 3DPE')
         assert 'num_feats' in positional_encoding
         num_feats = positional_encoding['num_feats']
         assert num_feats * 2 == self.embed_dims, 'embed_dims should' \
@@ -204,6 +215,42 @@ class PETRHead(AnchorFreeHead):
         self.positional_encoding = build_positional_encoding(
                 positional_encoding)
         self.transformer = build_transformer(transformer)
+        cross_attentions = [
+            layer.attentions[1] for layer in self.transformer.decoder.layers
+        ]
+        enabled_urope = [
+            getattr(attention, 'urope', False)
+            for attention in cross_attentions
+        ]
+        if (self.with_urope != any(enabled_urope) or
+                len(set(enabled_urope)) != 1):
+            raise ValueError(
+                'position_embedding_mode and decoder cross-attention URoPE '
+                'flags must be enabled or disabled together in every layer')
+        if self.with_urope:
+            head_counts = {
+                attention.num_heads for attention in cross_attentions
+            }
+            if len(head_counts) != 1:
+                raise ValueError(
+                    'All URoPE cross-attention layers must use the same '
+                    'number of heads')
+            self.urope_num_heads = head_counts.pop()
+            urope_depth_num = self.urope_cfg.get('depth_num', 4)
+            if (urope_depth_num < 1 or
+                    self.urope_num_heads % urope_depth_num != 0):
+                raise ValueError(
+                    'urope depth_num must be a positive divisor of the '
+                    'cross-attention head count')
+            urope_min_depth = self.urope_cfg.get(
+                'min_depth', self.depth_start)
+            urope_max_depth = self.urope_cfg.get(
+                'max_depth', self.position_range[3])
+            if urope_max_depth <= urope_min_depth:
+                raise ValueError(
+                    'urope max_depth must be greater than min_depth')
+        else:
+            self.urope_num_heads = None
         self.code_weights = nn.Parameter(torch.tensor(
             self.code_weights, requires_grad=False), requires_grad=False)
         self.bbox_coder = build_bbox_coder(bbox_coder)
@@ -242,7 +289,11 @@ class PETRHead(AnchorFreeHead):
         self.reg_branches = nn.ModuleList(
             [reg_branch for _ in range(self.num_pred)])
 
-        if self.with_multiview:
+        if self.position_embedding_mode == 'urope':
+            # Replacement mode bypasses additive positional embeddings.  Do
+            # not leave trainable adapt_pos3d weights unused under DDP.
+            self.adapt_pos3d = nn.Identity()
+        elif self.with_multiview:
             self.adapt_pos3d = nn.Sequential(
                 nn.Conv2d(self.embed_dims*3//2, self.embed_dims*4, kernel_size=1, stride=1, padding=0),
                 nn.ReLU(),
@@ -255,7 +306,8 @@ class PETRHead(AnchorFreeHead):
                 nn.Conv2d(self.embed_dims, self.embed_dims, kernel_size=1, stride=1, padding=0),
             )
 
-        if self.with_position:
+        if (self.with_position and
+                self.position_embedding_mode != 'urope'):
             self.position_encoder = nn.Sequential(
                 nn.Conv2d(self.position_dim, self.embed_dims*4, kernel_size=1, stride=1, padding=0),
                 nn.ReLU(),
@@ -386,7 +438,10 @@ class PETRHead(AnchorFreeHead):
         masks = F.interpolate(
             masks, size=x.shape[-2:]).to(torch.bool)
 
-        if self.with_position:
+        if self.position_embedding_mode == 'urope':
+            # URoPE supplies relative Q/K geometry inside cross-attention.
+            pos_embed = torch.zeros_like(x)
+        elif self.with_position:
             coords_position_embeding, _ = self.position_embeding(mlvl_feats, img_metas, masks)
             pos_embed = coords_position_embeding
             if self.with_multiview:
@@ -416,7 +471,21 @@ class PETRHead(AnchorFreeHead):
         query_embeds = self.query_embedding(pos2posemb3d(reference_points))
         reference_points = reference_points.unsqueeze(0).repeat(batch_size, 1, 1) #.sigmoid()
 
-        outs_dec, _ = self.transformer(x, masks, query_embeds, pos_embed, self.reg_branches)
+        urope_query_points = None
+        urope_key_points = None
+        if self.with_urope:
+            urope_query_points, urope_key_points = build_urope_3d_positions(
+                reference_points, img_metas, x.shape[-2:], self.pc_range,
+                self.urope_num_heads,
+                depth_num=self.urope_cfg.get('depth_num', 4),
+                min_depth=self.urope_cfg.get('min_depth', self.depth_start),
+                max_depth=self.urope_cfg.get('max_depth', self.position_range[3]),
+                lid=self.urope_cfg.get('lid', False))
+
+        outs_dec, _ = self.transformer(
+            x, masks, query_embeds, pos_embed, self.reg_branches,
+            urope_query_points=urope_query_points,
+            urope_key_points=urope_key_points)
         outs_dec = torch.nan_to_num(outs_dec)
         outputs_classes = []
         outputs_coords = []

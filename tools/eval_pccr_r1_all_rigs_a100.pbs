@@ -1,0 +1,21 @@
+#!/bin/bash -l
+#PBS -N petr_R1_all_rigs
+#PBS -l select=1:ncpus=12:ngpus=1:mem=48GB:gpu_id=A100
+#PBS -l walltime=06:00:00
+#PBS -m abe
+#PBS -j oe
+
+set -eo pipefail
+
+conda activate petr
+
+PETR_DIR=/mnt/hpccs01/home/n12893251/dasith_ws/dev_ws/PETR
+cd "$PETR_DIR"
+export PETR_DIR
+export PYTHONPATH="$PETR_DIR:${PYTHONPATH:-}"
+
+echo "PBS job: ${PBS_JOBID:-unknown}"
+echo "Host: $(hostname)"
+nvidia-smi
+
+bash tools/eval_pccr_r1_all_rigs.sh

@@ -29,6 +29,7 @@ from mmcv.utils import (ConfigDict, build_from_cfg, deprecated_api_warning,
                         to_2tuple)
 import copy
 import torch.utils.checkpoint as cp
+from .urope import apply_urope_3d
 
 @TRANSFORMER.register_module()
 class PETRTransformer(BaseModule):
@@ -67,7 +68,8 @@ class PETRTransformer(BaseModule):
         self._is_init = True
 
 
-    def forward(self, x, mask, query_embed, pos_embed, reg_branch=None):
+    def forward(self, x, mask, query_embed, pos_embed, reg_branch=None,
+                urope_query_points=None, urope_key_points=None):
         """Forward function for `Transformer`.
         Args:
             x (Tensor): Input query with shape [bs, c, h, w] where
@@ -104,6 +106,8 @@ class PETRTransformer(BaseModule):
             query_pos=query_embed,
             key_padding_mask=mask,
             reg_branch=reg_branch,
+            urope_query_points=urope_query_points,
+            urope_key_points=urope_key_points,
             )
         out_dec = out_dec.transpose(1, 2)
         memory = memory.reshape(n, h, w, bs, c).permute(3, 0, 4, 1, 2)
@@ -242,6 +246,8 @@ class PETRTransformerDecoderLayer(BaseTransformerLayer):
                 attn_masks=None,
                 query_key_padding_mask=None,
                 key_padding_mask=None,
+                urope_query_points=None,
+                urope_key_points=None,
                 ):
         """Forward function for `TransformerCoder`.
         Returns:
@@ -256,6 +262,8 @@ class PETRTransformerDecoderLayer(BaseTransformerLayer):
                 attn_masks=attn_masks,
                 query_key_padding_mask=query_key_padding_mask,
                 key_padding_mask=key_padding_mask,
+                urope_query_points=urope_query_points,
+                urope_key_points=urope_key_points,
                 )
 
         return x
@@ -269,6 +277,8 @@ class PETRTransformerDecoderLayer(BaseTransformerLayer):
                 attn_masks=None,
                 query_key_padding_mask=None,
                 key_padding_mask=None,
+                urope_query_points=None,
+                urope_key_points=None,
                 **kwargs
                 ):
         """Forward function for `TransformerCoder`.
@@ -287,6 +297,8 @@ class PETRTransformerDecoderLayer(BaseTransformerLayer):
                 attn_masks,
                 query_key_padding_mask,
                 key_padding_mask,
+                urope_query_points,
+                urope_key_points,
                 )
         else:
             x = self._forward(
@@ -297,7 +309,9 @@ class PETRTransformerDecoderLayer(BaseTransformerLayer):
             key_pos=key_pos,
             attn_masks=attn_masks,
             query_key_padding_mask=query_key_padding_mask,
-            key_padding_mask=key_padding_mask
+            key_padding_mask=key_padding_mask,
+            urope_query_points=urope_query_points,
+            urope_key_points=urope_key_points,
             )
         return x
 
@@ -330,6 +344,9 @@ class PETRMultiheadAttention(BaseModule):
                  dropout_layer=dict(type='Dropout', drop_prob=0.),
                  init_cfg=None,
                  batch_first=False,
+                 urope=False,
+                 urope_freq_base=100.0,
+                 urope_freq_scale=1.0,
                  **kwargs):
         super(PETRMultiheadAttention, self).__init__(init_cfg)
         if 'dropout' in kwargs:
@@ -344,6 +361,9 @@ class PETRMultiheadAttention(BaseModule):
         self.embed_dims = embed_dims
         self.num_heads = num_heads
         self.batch_first = batch_first
+        self.urope = urope
+        self.urope_freq_base = urope_freq_base
+        self.urope_freq_scale = urope_freq_scale
 
         self.attn = nn.MultiheadAttention(embed_dims, num_heads, attn_drop,
                                           **kwargs)
@@ -363,6 +383,8 @@ class PETRMultiheadAttention(BaseModule):
                 key_pos=None,
                 attn_mask=None,
                 key_padding_mask=None,
+                urope_query_points=None,
+                urope_key_points=None,
                 **kwargs):
         """Forward function for `MultiheadAttention`.
         **kwargs allow passing a more general data flow when combining
@@ -431,17 +453,77 @@ class PETRMultiheadAttention(BaseModule):
             key = key.transpose(0, 1)
             value = value.transpose(0, 1)
 
-        out = self.attn(
-            query=query,
-            key=key,
-            value=value,
-            attn_mask=attn_mask,
-            key_padding_mask=key_padding_mask)[0]
+        if self.urope:
+            if urope_query_points is None or urope_key_points is None:
+                raise ValueError('URoPE attention requires query/key 3D points')
+            out = self._urope_attention(
+                query, key, value, urope_query_points, urope_key_points,
+                attn_mask=attn_mask, key_padding_mask=key_padding_mask)
+        else:
+            out = self.attn(
+                query=query,
+                key=key,
+                value=value,
+                attn_mask=attn_mask,
+                key_padding_mask=key_padding_mask)[0]
 
         if self.batch_first:
             out = out.transpose(0, 1)
 
         return identity + self.dropout_layer(self.proj_drop(out))
+
+    def _urope_attention(self, query, key, value, query_points, key_points,
+                         attn_mask=None, key_padding_mask=None):
+        """Multi-head attention with URoPE applied after Q/K projection."""
+        if self.attn.bias_k is not None or self.attn.bias_v is not None:
+            raise NotImplementedError('URoPE does not support add_bias_kv')
+        tgt_len, batch_size, _ = query.shape
+        src_len = key.size(0)
+        head_dim = self.embed_dims // self.num_heads
+
+        weights = self.attn.in_proj_weight
+        bias = self.attn.in_proj_bias
+        q = F.linear(query, weights[:self.embed_dims],
+                     None if bias is None else bias[:self.embed_dims])
+        k = F.linear(key, weights[self.embed_dims:2 * self.embed_dims],
+                     None if bias is None else bias[self.embed_dims:2 * self.embed_dims])
+        v = F.linear(value, weights[2 * self.embed_dims:],
+                     None if bias is None else bias[2 * self.embed_dims:])
+
+        q = q.permute(1, 0, 2).reshape(
+            batch_size, tgt_len, self.num_heads, head_dim).transpose(1, 2)
+        k = k.permute(1, 0, 2).reshape(
+            batch_size, src_len, self.num_heads, head_dim).transpose(1, 2)
+        v = v.permute(1, 0, 2).reshape(
+            batch_size, src_len, self.num_heads, head_dim).transpose(1, 2)
+
+        q = apply_urope_3d(q, query_points, self.urope_freq_base,
+                           self.urope_freq_scale)
+        k = apply_urope_3d(k, key_points, self.urope_freq_base,
+                           self.urope_freq_scale)
+        scores = torch.matmul(q, k.transpose(-2, -1)) / math.sqrt(head_dim)
+
+        if attn_mask is not None:
+            if attn_mask.dim() == 2:
+                attn_mask = attn_mask[None, None]
+            elif attn_mask.dim() == 3:
+                attn_mask = attn_mask.view(
+                    batch_size, self.num_heads, tgt_len, src_len)
+            if attn_mask.dtype == torch.bool or attn_mask.dtype == torch.uint8:
+                scores = scores.masked_fill(attn_mask.to(torch.bool), float('-inf'))
+            else:
+                scores = scores + attn_mask
+        if key_padding_mask is not None:
+            scores = scores.masked_fill(
+                key_padding_mask[:, None, None, :].to(torch.bool),
+                float('-inf'))
+
+        attention = F.softmax(scores.float(), dim=-1).to(dtype=q.dtype)
+        attention = F.dropout(attention, p=self.attn.dropout,
+                              training=self.training)
+        out = torch.matmul(attention, v).transpose(1, 2).contiguous()
+        out = out.view(batch_size, tgt_len, self.embed_dims).transpose(0, 1)
+        return self.attn.out_proj(out)
 
 
 
@@ -523,4 +605,3 @@ class PETRTransformerDecoder(TransformerLayerSequence):
                 else:
                     intermediate.append(query)
         return torch.stack(intermediate)
-

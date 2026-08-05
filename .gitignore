@@ -115,12 +115,22 @@ data
 *.pkl.json
 *.log.json
 work_dirs/
+results/
+visualizations/
 ckpts/
 data/
 mmdetection3d/
 exps/
 *~
 mmdet3d/.mim
+
+# Local training/evaluation artifacts
+*.o[0-9]*
+*.mp4
+
+# macOS metadata (including AppleDouble files on network volumes)
+.DS_Store
+._*
 
 # Pytorch
 *.pth

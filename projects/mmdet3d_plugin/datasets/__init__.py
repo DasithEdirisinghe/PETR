@@ -9,8 +9,9 @@
 # ------------------------------------------------------------------------
 from .nuscenes_dataset import CustomNuScenesDataset
 from .multi_nuscenes_dataset import MultiCustomNuScenesDataset
+from .pccr_dataset import PCCRDataset
 __all__ = [
-    'CustomNuScenesDataset','MultiCustomNuScenesDataset'
+    'CustomNuScenesDataset','MultiCustomNuScenesDataset', 'PCCRDataset'
 ]
 
 
