@@ -1,0 +1,134 @@
+#!/bin/bash -l
+#PBS -N petr_oracle_r1
+#PBS -l select=1:ncpus=24:ngpus=2:mem=80GB:gpu_id=A100
+#PBS -l walltime=48:00:00
+#PBS -m abe
+#PBS -j oe
+
+set -eo pipefail
+
+conda activate petr
+
+PETR_DIR="${PETR_DIR:-/mnt/hpccs01/home/n12893251/dasith_ws/dev_ws/PETR}"
+cd "$PETR_DIR"
+export PETR_DIR
+export PYTHONPATH="$PETR_DIR:${PYTHONPATH:-}"
+
+CONFIG="${CONFIG:-projects/configs/petr/petr_r50dcn_gridmask_p4_800x320_pccr_lidar_oracle.py}"
+OUTPUT_DIR="${OUTPUT_DIR:-results/petr_r50dcn_gridmask_p4_800x320_pccr_lidar_oracle/R1}"
+NUM_TRAIN_GPUS="${NUM_TRAIN_GPUS:-2}"
+MODEL_NAME="${MODEL_NAME:-PETR-LiDAR-OraclePE}"
+TRAIN_RIG="${TRAIN_RIG:-R1}"
+
+echo "PBS job: ${PBS_JOBID:-unknown}"
+echo "Host: $(hostname)"
+echo "Working directory: $(pwd)"
+echo "Config: $CONFIG"
+echo "Output directory: $OUTPUT_DIR"
+nvidia-smi
+
+echo "Running synthetic, configuration, and one-sample oracle sanity checks."
+python tools/sanity_check_lidar_oracle.py \
+    --config "$CONFIG" \
+    --full-forward
+
+echo "Starting LiDAR-oracle PETR training."
+bash tools/dist_train.sh "$CONFIG" "$NUM_TRAIN_GPUS" \
+    --work-dir "$OUTPUT_DIR" \
+    --seed 0
+
+CHECKPOINT="$OUTPUT_DIR/latest.pth"
+if [[ ! -f "$CHECKPOINT" ]]; then
+    echo "Training completed without the expected checkpoint: $CHECKPOINT" >&2
+    exit 1
+fi
+
+echo "Training complete. Starting LiDAR-assisted evaluation on all rigs."
+export MODEL_NAME
+export TRAIN_RIG
+export CONFIG
+export CHECKPOINT
+export DATA_ROOT="${DATA_ROOT:-data/pccr}"
+export OUTPUT_ROOT="${OUTPUT_ROOT:-$OUTPUT_DIR/cross_rig}"
+export SAMPLES_PER_GPU="${SAMPLES_PER_GPU:-4}"
+export WORKERS_PER_GPU="${WORKERS_PER_GPU:-4}"
+export BASE_PORT="${BASE_PORT:-29600}"
+export SKIP_COMPLETED="${SKIP_COMPLETED:-1}"
+
+bash tools/eval_pccr_r1_all_rigs.sh
+
+BASELINE_RESULT="$PETR_DIR/results/"\
+"petr_r50dcn_gridmask_p4_800x320_pccr/R1/cross_rig/"\
+"standardized/PETR/trained_on_R1.json"
+NO_3DPE_RESULT="$PETR_DIR/results/"\
+"petr_r50dcn_gridmask_p4_800x320_pccr_no_3dpe/R1/cross_rig/"\
+"standardized/PETR-No3DPE/trained_on_R1.json"
+UROPE_RESULT="$PETR_DIR/results/"\
+"petr_r50dcn_gridmask_p4_800x320_pccr_urope/R1/cross_rig/"\
+"standardized/PETR-URoPE/trained_on_R1.json"
+HYBRID_RESULT="$PETR_DIR/results/"\
+"petr_r50dcn_gridmask_p4_800x320_pccr_urope_hybrid/R1/cross_rig/"\
+"standardized/PETR-Hybrid3DPE-URoPE/trained_on_R1.json"
+ORACLE_RESULT="$OUTPUT_ROOT/standardized/$MODEL_NAME/trained_on_$TRAIN_RIG.json"
+PLOT_DIR="$OUTPUT_ROOT/comparison"
+PLOT_STEM="$PLOT_DIR/petr_lidar_oracle_cross_rig_map"
+
+if [[ -f "$BASELINE_RESULT" && -f "$ORACLE_RESULT" ]]; then
+    mkdir -p "$PLOT_DIR"
+    plot_args=(
+        "$BASELINE_RESULT"
+        "$ORACLE_RESULT"
+        "$PLOT_STEM.svg"
+        --reference-label "PETR baseline"
+        --new-label "PETR LiDAR Oracle PE"
+        --reference-components "petr3dpe,multiview,query3d"
+        --new-components "lidar_oracle,multiview,query3d"
+        --train-rig "$TRAIN_RIG"
+    )
+
+    optional_results=()
+    optional_labels=()
+    optional_components=()
+    if [[ -f "$NO_3DPE_RESULT" ]]; then
+        optional_results+=("$NO_3DPE_RESULT")
+        optional_labels+=("PETR without image 3DPE")
+        optional_components+=("multiview,query3d")
+    fi
+    if [[ -f "$UROPE_RESULT" ]]; then
+        optional_results+=("$UROPE_RESULT")
+        optional_labels+=("PETR with pure URoPE")
+        optional_components+=("urope,query3d")
+    fi
+    if [[ -f "$HYBRID_RESULT" ]]; then
+        optional_results+=("$HYBRID_RESULT")
+        optional_labels+=("PETR 3DPE + URoPE")
+        optional_components+=("petr3dpe,multiview,urope,query3d")
+    fi
+
+    option_names=(third fourth fifth)
+    for index in "${!optional_results[@]}"; do
+        option_name="${option_names[$index]}"
+        plot_args+=(
+            "--$option_name" "${optional_results[$index]}"
+            "--${option_name}-label" "${optional_labels[$index]}"
+            "--${option_name}-components" "${optional_components[$index]}"
+        )
+    done
+
+    echo "Generating the LiDAR-oracle geometry comparison."
+    python tools/analysis_tools/plot_cross_rig_comparison.py "${plot_args[@]}"
+
+    if command -v rsvg-convert >/dev/null 2>&1; then
+        rsvg-convert -w 1600 -h 1040 "$PLOT_STEM.svg" -o "$PLOT_STEM.png"
+        echo "PNG comparison: $PLOT_STEM.png"
+    else
+        echo "rsvg-convert is unavailable; SVG comparison was still generated."
+    fi
+    echo "SVG comparison: $PLOT_STEM.svg"
+else
+    echo "Skipping comparison plot because a required result is missing:"
+    [[ -f "$BASELINE_RESULT" ]] || echo "  $BASELINE_RESULT"
+    [[ -f "$ORACLE_RESULT" ]] || echo "  $ORACLE_RESULT"
+fi
+
+echo "LiDAR-oracle training and cross-rig evaluation pipeline complete."

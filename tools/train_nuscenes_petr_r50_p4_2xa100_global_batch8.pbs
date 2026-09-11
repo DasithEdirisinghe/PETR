@@ -1,0 +1,48 @@
+#!/bin/bash -l
+#PBS -N petr_nusc_bs8
+#PBS -l select=1:ncpus=24:ngpus=2:mem=96GB:gpu_id=A100
+#PBS -l walltime=48:00:00
+#PBS -m abe
+#PBS -j oe
+
+set -eo pipefail
+
+conda activate petr
+
+PETR_DIR=/home/n12893251/dasith_ws/dev_ws/PETR
+cd "$PETR_DIR"
+export PYTHONPATH="$PETR_DIR:${PYTHONPATH:-}"
+
+CONFIG=${CONFIG:-projects/configs/petr/petr_r50dcn_gridmask_p4_nuscenes_fresh_2gpu_global_batch8.py}
+OUTPUT_DIR=${OUTPUT_DIR:-results/petr_r50dcn_gridmask_p4_nuscenes_fresh_2gpu_global_batch8}
+SEED=${SEED:-0}
+PORT=${PORT:-29518}
+
+# Fail before requesting a long training run if required inputs are missing.
+test -f "$CONFIG"
+test -f ckpts/resnet50_msra-5891d200.pth
+test -f data/nuscenes/nuscenes_infos_temporal_train.pkl
+test -f data/nuscenes/nuscenes_infos_temporal_val.pkl
+test -d data/nuscenes/samples
+test -d data/nuscenes/v1.0-trainval
+test -f ../mmdetection3d/configs/_base_/datasets/nus-3d.py
+
+mkdir -p "$OUTPUT_DIR"
+
+echo "PBS job: ${PBS_JOBID:-unknown}"
+echo "Host: $(hostname)"
+echo "Working directory: $(pwd)"
+echo "Config: $CONFIG"
+echo "Output: $OUTPUT_DIR"
+echo "Seed: $SEED"
+echo "Fresh detector: load_from=None, resume_from=None"
+echo "Initialization: ImageNet ResNet-50 only"
+echo "Batch: 2 GPUs x 4 samples/GPU = global batch size 8"
+echo "Learning rate: 2e-4"
+nvidia-smi
+
+PORT="$PORT" bash tools/dist_train.sh \
+    "$CONFIG" \
+    2 \
+    --work-dir "$OUTPUT_DIR" \
+    --seed "$SEED"

@@ -1,0 +1,93 @@
+#!/bin/bash -l
+#PBS -N petr_no3dpe_r1
+#PBS -l select=1:ncpus=24:ngpus=2:mem=80GB:gpu_id=A100
+#PBS -l walltime=48:00:00
+#PBS -m abe
+#PBS -j oe
+
+set -eo pipefail
+
+conda activate petr
+
+PETR_DIR="${PETR_DIR:-/mnt/hpccs01/home/n12893251/dasith_ws/dev_ws/PETR}"
+cd "$PETR_DIR"
+export PETR_DIR
+export PYTHONPATH="$PETR_DIR:${PYTHONPATH:-}"
+
+CONFIG="${CONFIG:-projects/configs/petr/petr_r50dcn_gridmask_p4_800x320_pccr_no_3dpe.py}"
+OUTPUT_DIR="${OUTPUT_DIR:-results/petr_r50dcn_gridmask_p4_800x320_pccr_no_3dpe/R1}"
+NUM_TRAIN_GPUS="${NUM_TRAIN_GPUS:-2}"
+MODEL_NAME="${MODEL_NAME:-PETR-No3DPE}"
+TRAIN_RIG="${TRAIN_RIG:-R1}"
+
+echo "PBS job: ${PBS_JOBID:-unknown}"
+echo "Host: $(hostname)"
+echo "Working directory: $(pwd)"
+echo "Config: $CONFIG"
+echo "Output directory: $OUTPUT_DIR"
+nvidia-smi
+
+echo "Starting training."
+bash tools/dist_train.sh "$CONFIG" "$NUM_TRAIN_GPUS" \
+    --work-dir "$OUTPUT_DIR" \
+    --seed 0
+
+CHECKPOINT="$OUTPUT_DIR/latest.pth"
+if [[ ! -f "$CHECKPOINT" ]]; then
+    echo "Training completed without the expected checkpoint: $CHECKPOINT" >&2
+    exit 1
+fi
+
+echo "Training complete. Starting evaluation on all rigs."
+export MODEL_NAME
+export TRAIN_RIG
+export CONFIG
+export CHECKPOINT
+export DATA_ROOT="${DATA_ROOT:-data/pccr}"
+export OUTPUT_ROOT="${OUTPUT_ROOT:-$OUTPUT_DIR/cross_rig}"
+export SAMPLES_PER_GPU="${SAMPLES_PER_GPU:-4}"
+export WORKERS_PER_GPU="${WORKERS_PER_GPU:-4}"
+export BASE_PORT="${BASE_PORT:-29600}"
+export SKIP_COMPLETED="${SKIP_COMPLETED:-1}"
+
+bash tools/eval_pccr_r1_all_rigs.sh
+
+REFERENCE_RESULT="$PETR_DIR/../plentiful-carla-camera-rigs/models/results/PETR/trained_on_R1.json"
+BASELINE_RESULT="$PETR_DIR/results/petr_r50dcn_gridmask_p4_800x320_pccr/R1/cross_rig/standardized/PETR/trained_on_R1.json"
+UROPE_RESULT="$PETR_DIR/results/petr_r50dcn_gridmask_p4_800x320_pccr_urope/R1/cross_rig/standardized/PETR-URoPE/trained_on_R1.json"
+NO_3DPE_RESULT="$OUTPUT_ROOT/standardized/$MODEL_NAME/trained_on_$TRAIN_RIG.json"
+PLOT_DIR="$OUTPUT_ROOT/comparison"
+PLOT_SVG="$PLOT_DIR/pccr_vs_new_petr_vs_urope_vs_no3dpe_cross_rig_map.svg"
+PLOT_PNG="$PLOT_DIR/pccr_vs_new_petr_vs_urope_vs_no3dpe_cross_rig_map.png"
+
+if [[ -f "$REFERENCE_RESULT" && -f "$BASELINE_RESULT" && \
+      -f "$UROPE_RESULT" && -f "$NO_3DPE_RESULT" ]]; then
+    echo "Generating four-model cross-rig comparison."
+    python tools/analysis_tools/plot_cross_rig_comparison.py \
+        "$REFERENCE_RESULT" \
+        "$BASELINE_RESULT" \
+        "$PLOT_SVG" \
+        --reference-label "PCCR-reported PETR" \
+        --new-label "Newly trained PETR" \
+        --third "$UROPE_RESULT" \
+        --third-label "PETR + URoPE" \
+        --fourth "$NO_3DPE_RESULT" \
+        --fourth-label "PETR without 3D PE" \
+        --train-rig "$TRAIN_RIG"
+
+    if command -v rsvg-convert >/dev/null 2>&1; then
+        rsvg-convert -w 1600 -h 1040 "$PLOT_SVG" -o "$PLOT_PNG"
+        echo "PNG comparison: $PLOT_PNG"
+    else
+        echo "rsvg-convert is unavailable; SVG comparison was still generated."
+    fi
+    echo "SVG comparison: $PLOT_SVG"
+else
+    echo "Skipping comparison plot because one or more result files are missing:"
+    for result_file in "$REFERENCE_RESULT" "$BASELINE_RESULT" \
+            "$UROPE_RESULT" "$NO_3DPE_RESULT"; do
+        [[ -f "$result_file" ]] || echo "  $result_file"
+    done
+fi
+
+echo "Training and cross-rig evaluation pipeline complete."

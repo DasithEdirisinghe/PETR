@@ -1,0 +1,47 @@
+#!/bin/bash -l
+#PBS -N petr_nusc_vis
+#PBS -l select=1:ncpus=8:ngpus=1:mem=48GB:gpu_id=A100
+#PBS -l walltime=02:00:00
+#PBS -m abe
+#PBS -j oe
+
+set -eo pipefail
+
+conda activate petr
+
+PETR_DIR=/mnt/hpccs01/home/n12893251/dasith_ws/dev_ws/PETR
+cd "$PETR_DIR"
+export PYTHONPATH="$PETR_DIR:${PYTHONPATH:-}"
+
+CONFIG=${CONFIG:-projects/configs/petr/petr_r50dcn_gridmask_p4_nuscenes_local.py}
+CHECKPOINT=${CHECKPOINT:-ckpts/petr_r50dcn_gridmask_p4_epoch_24.pth}
+OUTPUT_DIR=${OUTPUT_DIR:-visualizations/nuscenes_sanity}
+MAX_FRAMES=${MAX_FRAMES:-1}
+SEED=${SEED:-0}
+SCORE_THRESHOLD=${SCORE_THRESHOLD:-0.25}
+
+test -f "$CHECKPOINT"
+test -f data/nuscenes/nuscenes_infos_temporal_val.pkl
+test -d data/nuscenes/samples
+
+ARGS=(
+    --config "$CONFIG"
+    --checkpoint "$CHECKPOINT"
+    --output-dir "$OUTPUT_DIR"
+    --max-frames "$MAX_FRAMES"
+    --seed "$SEED"
+    --score-threshold "$SCORE_THRESHOLD"
+)
+
+if [[ -n "${SCENE_NAME:-}" ]]; then
+    ARGS+=(--scene-name "$SCENE_NAME")
+fi
+if [[ -n "${SAMPLE_INDEX:-}" ]]; then
+    ARGS+=(--sample-index "$SAMPLE_INDEX")
+fi
+if [[ "${VIDEO:-0}" == "1" ]]; then
+    command -v ffmpeg >/dev/null
+    ARGS+=(--video)
+fi
+
+python -u tools/visualize_nuscenes_petr_scene.py "${ARGS[@]}"

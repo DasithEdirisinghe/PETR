@@ -1,0 +1,115 @@
+#!/bin/bash -l
+#PBS -N petr_urope_mvpe_r1
+#PBS -l select=1:ncpus=24:ngpus=2:mem=80GB:gpu_id=A100
+#PBS -l walltime=48:00:00
+#PBS -m abe
+#PBS -j oe
+
+set -eo pipefail
+
+conda activate petr
+
+PETR_DIR="${PETR_DIR:-/mnt/hpccs01/home/n12893251/dasith_ws/dev_ws/PETR}"
+cd "$PETR_DIR"
+export PETR_DIR
+export PYTHONPATH="$PETR_DIR:${PYTHONPATH:-}"
+
+CONFIG="${CONFIG:-projects/configs/petr/petr_r50dcn_gridmask_p4_800x320_pccr_urope_multiview.py}"
+OUTPUT_DIR="${OUTPUT_DIR:-results/petr_r50dcn_gridmask_p4_800x320_pccr_urope_multiview/R1}"
+NUM_TRAIN_GPUS="${NUM_TRAIN_GPUS:-2}"
+MODEL_NAME="${MODEL_NAME:-PETR-URoPE-MultiviewPE}"
+TRAIN_RIG="${TRAIN_RIG:-R1}"
+
+echo "PBS job: ${PBS_JOBID:-unknown}"
+echo "Host: $(hostname)"
+echo "Working directory: $(pwd)"
+echo "Config: $CONFIG"
+echo "Output directory: $OUTPUT_DIR"
+nvidia-smi
+
+echo "Checking the URoPE + multiview PE model configuration."
+python tools/smoke_test_urope.py --config "$CONFIG"
+
+echo "Starting training."
+bash tools/dist_train.sh "$CONFIG" "$NUM_TRAIN_GPUS" \
+    --work-dir "$OUTPUT_DIR" \
+    --seed 0
+
+CHECKPOINT="$OUTPUT_DIR/latest.pth"
+if [[ ! -f "$CHECKPOINT" ]]; then
+    echo "Training completed without the expected checkpoint: $CHECKPOINT" >&2
+    exit 1
+fi
+
+echo "Training complete. Starting evaluation on all rigs."
+export MODEL_NAME
+export TRAIN_RIG
+export CONFIG
+export CHECKPOINT
+export DATA_ROOT="${DATA_ROOT:-data/pccr}"
+export OUTPUT_ROOT="${OUTPUT_ROOT:-$OUTPUT_DIR/cross_rig}"
+export SAMPLES_PER_GPU="${SAMPLES_PER_GPU:-4}"
+export WORKERS_PER_GPU="${WORKERS_PER_GPU:-4}"
+export BASE_PORT="${BASE_PORT:-29600}"
+export SKIP_COMPLETED="${SKIP_COMPLETED:-1}"
+
+bash tools/eval_pccr_r1_all_rigs.sh
+
+BASELINE_RESULT="$PETR_DIR/results/petr_r50dcn_gridmask_p4_800x320_pccr/R1/cross_rig/standardized/PETR/trained_on_R1.json"
+NO_3DPE_RESULT="$PETR_DIR/results/petr_r50dcn_gridmask_p4_800x320_pccr_no_3dpe/R1/cross_rig/standardized/PETR-No3DPE/trained_on_R1.json"
+UROPE_RESULT="$PETR_DIR/results/petr_r50dcn_gridmask_p4_800x320_pccr_urope/R1/cross_rig/standardized/PETR-URoPE/trained_on_R1.json"
+MULTIVIEW_RESULT="$OUTPUT_ROOT/standardized/$MODEL_NAME/trained_on_$TRAIN_RIG.json"
+HYBRID_RESULT="$PETR_DIR/results/petr_r50dcn_gridmask_p4_800x320_pccr_urope_hybrid/R1/cross_rig/standardized/PETR-Hybrid3DPE-URoPE/trained_on_R1.json"
+PLOT_DIR="$OUTPUT_ROOT/comparison"
+PLOT_STEM="$PLOT_DIR/petr_geometry_ablation_cross_rig_map"
+
+required_results=(
+    "$BASELINE_RESULT"
+    "$NO_3DPE_RESULT"
+    "$UROPE_RESULT"
+    "$MULTIVIEW_RESULT"
+)
+missing_result=0
+for result_file in "${required_results[@]}"; do
+    if [[ ! -f "$result_file" ]]; then
+        echo "Missing comparison result: $result_file"
+        missing_result=1
+    fi
+done
+
+if [[ "$missing_result" == "0" ]]; then
+    mkdir -p "$PLOT_DIR"
+    plot_args=(
+        "$BASELINE_RESULT"
+        "$NO_3DPE_RESULT"
+        "$PLOT_STEM.svg"
+        --reference-label "PETR baseline"
+        --new-label "PETR without image 3DPE"
+        --third "$UROPE_RESULT"
+        --third-label "PETR with pure URoPE"
+        --fourth "$MULTIVIEW_RESULT"
+        --fourth-label "URoPE + multiview PE"
+        --train-rig "$TRAIN_RIG"
+    )
+    if [[ -f "$HYBRID_RESULT" ]]; then
+        plot_args+=(
+            --fifth "$HYBRID_RESULT"
+            --fifth-label "PETR 3DPE + URoPE"
+        )
+    fi
+
+    echo "Generating the controlled geometry-encoding comparison."
+    python tools/analysis_tools/plot_cross_rig_comparison.py "${plot_args[@]}"
+
+    if command -v rsvg-convert >/dev/null 2>&1; then
+        rsvg-convert -w 1600 -h 1040 "$PLOT_STEM.svg" -o "$PLOT_STEM.png"
+        echo "PNG comparison: $PLOT_STEM.png"
+    else
+        echo "rsvg-convert is unavailable; SVG comparison was still generated."
+    fi
+    echo "SVG comparison: $PLOT_STEM.svg"
+else
+    echo "Skipping comparison plot because required existing results are missing."
+fi
+
+echo "URoPE + multiview PE training and evaluation pipeline complete."
