@@ -621,6 +621,7 @@ class GlobalRotScaleTransImage(object):
         translation_std=[0, 0, 0],
         reverse_angle=False,
         training=True,
+        transform_points=False,
     ):
 
         self.rot_range = rot_range
@@ -628,6 +629,7 @@ class GlobalRotScaleTransImage(object):
         self.translation_std = translation_std
 
         self.reverse_angle = reverse_angle
+        self.transform_points = transform_points
         self.training = training
 
     def __call__(self, results):
@@ -641,6 +643,12 @@ class GlobalRotScaleTransImage(object):
         rot_angle = np.random.uniform(*self.rot_range)
 
         self.rotate_bev_along_z(results, rot_angle)
+        # lidar2img is right-multiplied by the inverse virtual LiDAR
+        # rotation. Apply the corresponding forward rotation to loaded
+        # points so P_aug @ X_aug == P_original @ X_original. This is opt-in
+        # so all existing pipelines retain their previous point behavior.
+        if self.transform_points and "points" in results:
+            results["points"].rotate(rot_angle)
         if self.reverse_angle:
             rot_angle *= -1
         results["gt_bboxes_3d"].rotate(
@@ -650,6 +658,8 @@ class GlobalRotScaleTransImage(object):
         # random scale
         scale_ratio = np.random.uniform(*self.scale_ratio_range)
         self.scale_xyz(results, scale_ratio)
+        if self.transform_points and "points" in results:
+            results["points"].scale(scale_ratio)
         results["gt_bboxes_3d"].scale(scale_ratio)
 
         # TODO: support translation
@@ -920,4 +930,3 @@ class PhotoMetricDistortionMultiViewImage:
         repr_str += f'{(self.saturation_lower, self.saturation_upper)},\n'
         repr_str += f'hue_delta={self.hue_delta})'
         return repr_str
-

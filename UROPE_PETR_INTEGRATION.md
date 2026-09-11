@@ -33,6 +33,12 @@ The implementation is in:
 - `urope`: URoPE replaces additive PETR 3DPE;
 - `hybrid`: PETR 3DPE and URoPE are both enabled for an ablation.
 
+Pure `urope` mode disables additive image positional embeddings by default.
+Set `urope_with_multiview_pe=True` to additionally supply PETR's
+camera/row/column sine encoding to the image keys while retaining URoPE Q/K
+geometry.  The default is false so existing URoPE experiments and checkpoints
+are unchanged.
+
 ## Train
 
 On the configured PBS cluster:
@@ -90,10 +96,12 @@ rule, and evaluator for PETR and URoPE; ideally run three seeds.
 ## Recommended ablations
 
 1. Replacement: `position_embedding_mode='urope'` (primary experiment).
-2. Hybrid: `position_embedding_mode='hybrid'`, `with_position=True`.
-3. Depth anchors: 1, 2, 4, and 8 with eight attention heads.
-4. Spacing: uniform versus LID.
-5. Intrinsic perturbation: focal scaling within and outside the training range.
+2. Replacement plus multiview 2DPE: `position_embedding_mode='urope'` and
+   `urope_with_multiview_pe=True`.
+3. Hybrid: `position_embedding_mode='hybrid'`, `with_position=True`.
+4. Depth anchors: 1, 2, 4, and 8 with eight attention heads.
+5. Spacing: uniform versus LID.
+6. Intrinsic perturbation: focal scaling within and outside the training range.
 
 The current config uses four uniform camera-z anchors over `[1.0, 61.2)` m,
 shared by eight heads. This follows the paper's preferred four-anchor,

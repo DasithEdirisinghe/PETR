@@ -22,6 +22,8 @@ from mmdet.models.dense_heads.anchor_free_head import AnchorFreeHead
 from mmdet.models.utils.transformer import inverse_sigmoid
 from mmdet3d.core.bbox.coders import build_bbox_coder
 from projects.mmdet3d_plugin.core.bbox.util import normalize_bbox
+from projects.mmdet3d_plugin.models.utils.lidar_oracle_pe import \
+    build_lidar_oracle_position_embedding
 import numpy as np
 from mmcv.cnn import xavier_init, constant_init, kaiming_init
 import math
@@ -112,6 +114,8 @@ class PETRHead(AnchorFreeHead):
                  normedlinear=False,
                  position_embedding_mode='petr',
                  urope_cfg=None,
+                 urope_with_multiview_pe=False,
+                 lidar_oracle_cfg=None,
                  **kwargs):
         # NOTE here use `AnchorFreeHead` instead of `TransformerHead`,
         # since it brings inconvenience when the initialization of
@@ -181,14 +185,52 @@ class PETRHead(AnchorFreeHead):
         self.position_level = 0
         self.with_position = with_position
         self.with_multiview = with_multiview
-        if position_embedding_mode not in ('petr', 'urope', 'hybrid'):
-            raise ValueError('position_embedding_mode must be petr, urope, or hybrid')
+        valid_position_modes = ('petr', 'urope', 'hybrid', 'lidar_oracle')
+        if position_embedding_mode not in valid_position_modes:
+            raise ValueError(
+                'position_embedding_mode must be petr, urope, hybrid, or '
+                'lidar_oracle')
         self.position_embedding_mode = position_embedding_mode
         self.with_urope = position_embedding_mode in ('urope', 'hybrid')
+        self.with_lidar_oracle = position_embedding_mode == 'lidar_oracle'
         self.urope_cfg = dict(urope_cfg or {})
+        self.urope_with_multiview_pe = urope_with_multiview_pe
+        self.lidar_oracle_cfg = dict(lidar_oracle_cfg or {})
+        self.lidar_oracle_with_multiview_pe = self.lidar_oracle_cfg.get(
+            'with_multiview_pe', True)
         if position_embedding_mode == 'hybrid' and not with_position:
             raise ValueError(
                 'hybrid mode requires with_position=True to retain PETR 3DPE')
+        if (urope_with_multiview_pe and
+                position_embedding_mode != 'urope'):
+            raise ValueError(
+                'urope_with_multiview_pe is only valid in urope mode')
+        if urope_with_multiview_pe and not with_multiview:
+            raise ValueError(
+                'urope_with_multiview_pe requires with_multiview=True')
+        if self.with_lidar_oracle and with_position:
+            raise ValueError(
+                'lidar_oracle mode replaces PETR 3DPE and requires '
+                'with_position=False')
+        if (not self.with_lidar_oracle and lidar_oracle_cfg is not None):
+            raise ValueError(
+                'lidar_oracle_cfg is only valid in lidar_oracle mode')
+        if (self.with_lidar_oracle and
+                self.lidar_oracle_with_multiview_pe and not with_multiview):
+            raise ValueError(
+                'LiDAR-oracle multiview PE requires with_multiview=True')
+        if self.with_lidar_oracle:
+            axis_dims = (
+                self.lidar_oracle_cfg.get('x_num_feats', 84),
+                self.lidar_oracle_cfg.get('y_num_feats', 84),
+                self.lidar_oracle_cfg.get('z_num_feats', 88))
+            if any(dim <= 0 or dim % 2 for dim in axis_dims):
+                raise ValueError(
+                    'LiDAR-oracle axis dimensions must be positive and even')
+            oracle_dims = sum(axis_dims)
+            if oracle_dims != self.embed_dims:
+                raise ValueError(
+                    'LiDAR-oracle XYZ dimensions must sum to embed_dims')
         assert 'num_feats' in positional_encoding
         num_feats = positional_encoding['num_feats']
         assert num_feats * 2 == self.embed_dims, 'embed_dims should' \
@@ -289,7 +331,12 @@ class PETRHead(AnchorFreeHead):
         self.reg_branches = nn.ModuleList(
             [reg_branch for _ in range(self.num_pred)])
 
-        if self.position_embedding_mode == 'urope':
+        bypass_multiview_adapter = (
+            (self.position_embedding_mode == 'urope' and
+             not self.urope_with_multiview_pe) or
+            (self.with_lidar_oracle and
+             not self.lidar_oracle_with_multiview_pe))
+        if bypass_multiview_adapter:
             # Replacement mode bypasses additive positional embeddings.  Do
             # not leave trainable adapt_pos3d weights unused under DDP.
             self.adapt_pos3d = nn.Identity()
@@ -408,7 +455,7 @@ class PETRHead(AnchorFreeHead):
                                           strict, missing_keys,
                                           unexpected_keys, error_msgs)
     
-    def forward(self, mlvl_feats, img_metas):
+    def forward(self, mlvl_feats, img_metas, points=None):
         """Forward function.
         Args:
             mlvl_feats (tuple[Tensor]): Features from the upstream
@@ -438,9 +485,37 @@ class PETRHead(AnchorFreeHead):
         masks = F.interpolate(
             masks, size=x.shape[-2:]).to(torch.bool)
 
-        if self.position_embedding_mode == 'urope':
+        if self.with_lidar_oracle:
+            if points is None:
+                raise ValueError(
+                    'lidar_oracle mode requires LiDAR points at training and '
+                    'inference')
+            pos_embed = build_lidar_oracle_position_embedding(
+                points, img_metas, x.shape[-2:], self.position_range,
+                x_num_feats=self.lidar_oracle_cfg.get('x_num_feats', 84),
+                y_num_feats=self.lidar_oracle_cfg.get('y_num_feats', 84),
+                z_num_feats=self.lidar_oracle_cfg.get('z_num_feats', 88),
+                temperature=self.lidar_oracle_cfg.get(
+                    'temperature', 10000),
+                clamp=self.lidar_oracle_cfg.get('clamp', True),
+                fallback_depth=self.lidar_oracle_cfg.get(
+                    'fallback_depth', 20.0),
+                interpolation=self.lidar_oracle_cfg.get(
+                    'interpolation', 'nearest_depth')).to(
+                        device=x.device, dtype=x.dtype)
+            if self.lidar_oracle_with_multiview_pe:
+                multiview_embed = self.positional_encoding(masks)
+                multiview_embed = self.adapt_pos3d(
+                    multiview_embed.flatten(0, 1)).view(x.size())
+                pos_embed = pos_embed + multiview_embed
+        elif self.position_embedding_mode == 'urope':
             # URoPE supplies relative Q/K geometry inside cross-attention.
-            pos_embed = torch.zeros_like(x)
+            if self.urope_with_multiview_pe:
+                pos_embed = self.positional_encoding(masks)
+                pos_embed = self.adapt_pos3d(
+                    pos_embed.flatten(0, 1)).view(x.size())
+            else:
+                pos_embed = torch.zeros_like(x)
         elif self.with_position:
             coords_position_embeding, _ = self.position_embeding(mlvl_feats, img_metas, masks)
             pos_embed = coords_position_embeding

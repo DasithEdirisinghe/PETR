@@ -75,8 +75,12 @@ def test_config_build(config_path):
         test_cfg=cfg.get('test_cfg'))
     assert model.pts_bbox_head.position_embedding_mode == 'urope'
     assert model.pts_bbox_head.urope_num_heads == 8
-    assert not any('adapt_pos3d' in name
-                   for name, _ in model.named_parameters())
+    expected_multiview_pe = cfg.model.pts_bbox_head.get(
+        'urope_with_multiview_pe', False)
+    assert model.pts_bbox_head.urope_with_multiview_pe == expected_multiview_pe
+    has_adapt_pos3d_parameters = any(
+        'adapt_pos3d' in name for name, _ in model.named_parameters())
+    assert has_adapt_pos3d_parameters == expected_multiview_pe
     return cfg, model
 
 

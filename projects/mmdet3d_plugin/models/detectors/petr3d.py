@@ -94,7 +94,8 @@ class Petr3D(MVXTwoStageDetector):
                           gt_bboxes_3d,
                           gt_labels_3d,
                           img_metas,
-                          gt_bboxes_ignore=None):
+                          gt_bboxes_ignore=None,
+                          points=None):
         """Forward function for point cloud branch.
         Args:
             pts_feats (list[torch.Tensor]): Features of point cloud branch
@@ -108,7 +109,11 @@ class Petr3D(MVXTwoStageDetector):
         Returns:
             dict: Losses of each branch.
         """
-        outs = self.pts_bbox_head(pts_feats, img_metas)
+        if getattr(self.pts_bbox_head, 'with_lidar_oracle', False):
+            outs = self.pts_bbox_head(
+                pts_feats, img_metas, points=points)
+        else:
+            outs = self.pts_bbox_head(pts_feats, img_metas)
         loss_inputs = [gt_bboxes_3d, gt_labels_3d, outs]
         losses = self.pts_bbox_head.loss(*loss_inputs)
 
@@ -171,21 +176,26 @@ class Petr3D(MVXTwoStageDetector):
         losses = dict()
         losses_pts = self.forward_pts_train(img_feats, gt_bboxes_3d,
                                             gt_labels_3d, img_metas,
-                                            gt_bboxes_ignore)
+                                            gt_bboxes_ignore, points=points)
         losses.update(losses_pts)
         return losses
   
-    def forward_test(self, img_metas, img=None, **kwargs):
+    def forward_test(self, img_metas, img=None, points=None, **kwargs):
         for var, name in [(img_metas, 'img_metas')]:
             if not isinstance(var, list):
                 raise TypeError('{} must be a list, but got {}'.format(
                     name, type(var)))
         img = [img] if img is None else img
-        return self.simple_test(img_metas[0], img[0], **kwargs)
+        points = points[0] if points is not None else None
+        return self.simple_test(
+            img_metas[0], img[0], points=points, **kwargs)
 
-    def simple_test_pts(self, x, img_metas, rescale=False):
+    def simple_test_pts(self, x, img_metas, rescale=False, points=None):
         """Test function of point cloud branch."""
-        outs = self.pts_bbox_head(x, img_metas)
+        if getattr(self.pts_bbox_head, 'with_lidar_oracle', False):
+            outs = self.pts_bbox_head(x, img_metas, points=points)
+        else:
+            outs = self.pts_bbox_head(x, img_metas)
         bbox_list = self.pts_bbox_head.get_bboxes(
             outs, img_metas, rescale=rescale)
         bbox_results = [
@@ -193,14 +203,14 @@ class Petr3D(MVXTwoStageDetector):
             for bboxes, scores, labels in bbox_list
         ]
         return bbox_results
-    
-    def simple_test(self, img_metas, img=None, rescale=False):
+
+    def simple_test(self, img_metas, img=None, rescale=False, points=None):
         """Test function without augmentaiton."""
         img_feats = self.extract_feat(img=img, img_metas=img_metas)
 
         bbox_list = [dict() for i in range(len(img_metas))]
         bbox_pts = self.simple_test_pts(
-            img_feats, img_metas, rescale=rescale)
+            img_feats, img_metas, rescale=rescale, points=points)
         for result_dict, pts_bbox in zip(bbox_list, bbox_pts):
             result_dict['pts_bbox'] = pts_bbox
         return bbox_list
@@ -230,4 +240,3 @@ class Petr3D(MVXTwoStageDetector):
         for result_dict, pts_bbox in zip(bbox_list, bbox_pts):
             result_dict['pts_bbox'] = pts_bbox
         return bbox_list
-    

@@ -1,5 +1,5 @@
 #!/bin/bash -l
-#PBS -N petr_R1_all_rigs
+#PBS -N petr_cross_rig
 #PBS -l select=1:ncpus=12:ngpus=1:mem=48GB:gpu_id=A100
 #PBS -l walltime=06:00:00
 #PBS -m abe
@@ -14,8 +14,25 @@ cd "$PETR_DIR"
 export PETR_DIR
 export PYTHONPATH="$PETR_DIR:${PYTHONPATH:-}"
 
+# All values can be overridden with qsub -v. These defaults preserve the
+# original baseline PETR evaluation behavior.
+export MODEL_NAME="${MODEL_NAME:-PETR}"
+export TRAIN_RIG="${TRAIN_RIG:-R1}"
+export CONFIG="${CONFIG:-projects/configs/petr/petr_r50dcn_gridmask_p4_800x320_pccr.py}"
+export CHECKPOINT="${CHECKPOINT:-results/petr_r50dcn_gridmask_p4_800x320_pccr/R1/latest.pth}"
+export DATA_ROOT="${DATA_ROOT:-data/pccr}"
+export OUTPUT_ROOT="${OUTPUT_ROOT:-results/petr_r50dcn_gridmask_p4_800x320_pccr/R1/cross_rig}"
+export SAMPLES_PER_GPU="${SAMPLES_PER_GPU:-4}"
+export WORKERS_PER_GPU="${WORKERS_PER_GPU:-4}"
+export BASE_PORT="${BASE_PORT:-29600}"
+export SKIP_COMPLETED="${SKIP_COMPLETED:-1}"
+
 echo "PBS job: ${PBS_JOBID:-unknown}"
 echo "Host: $(hostname)"
+echo "Model label: $MODEL_NAME"
+echo "Config: $CONFIG"
+echo "Checkpoint: $CHECKPOINT"
+echo "Output root: $OUTPUT_ROOT"
 nvidia-smi
 
 bash tools/eval_pccr_r1_all_rigs.sh
