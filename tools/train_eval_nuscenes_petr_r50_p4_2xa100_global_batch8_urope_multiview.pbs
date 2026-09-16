@@ -1,0 +1,62 @@
+#!/bin/bash -l
+#PBS -N petr_nusc_urope_mvpe
+#PBS -l select=1:ncpus=24:ngpus=2:mem=96GB:gpu_id=A100
+#PBS -l walltime=48:00:00
+#PBS -m abe
+#PBS -j oe
+
+set -euo pipefail
+
+conda activate petr
+
+PETR_DIR="${PETR_DIR:-/mnt/hpccs01/home/n12893251/dasith_ws/dev_ws/PETR}"
+cd "$PETR_DIR"
+export PYTHONPATH="$PETR_DIR:${PYTHONPATH:-}"
+
+CONFIG="${CONFIG:-projects/configs/petr/petr_r50dcn_gridmask_p4_nuscenes_fresh_2gpu_global_batch8_urope_multiview.py}"
+OUTPUT_DIR="${OUTPUT_DIR:-results/petr_r50dcn_gridmask_p4_nuscenes_fresh_2gpu_global_batch8_urope_multiview}"
+SEED="${SEED:-0}"
+TRAIN_PORT="${TRAIN_PORT:-29520}"
+NUM_TRAIN_GPUS="${NUM_TRAIN_GPUS:-2}"
+
+# Fail early rather than consuming a long GPU allocation with missing inputs.
+test -f "$CONFIG"
+test -f ckpts/resnet50_msra-5891d200.pth
+test -f data/nuscenes/nuscenes_infos_temporal_train.pkl
+test -f data/nuscenes/nuscenes_infos_temporal_val.pkl
+test -d data/nuscenes/samples
+test -d data/nuscenes/v1.0-trainval
+test -f ../mmdetection3d/configs/_base_/datasets/nus-3d.py
+
+mkdir -p "$OUTPUT_DIR"
+
+echo "PBS job: ${PBS_JOBID:-unknown}"
+echo "Host: $(hostname)"
+echo "Working directory: $(pwd)"
+echo "Config: $CONFIG"
+echo "Training output: $OUTPUT_DIR"
+echo "Seed: $SEED"
+echo "Model: URoPE + multiview PE; learned PETR 3DPE disabled"
+echo "Training: $NUM_TRAIN_GPUS GPUs x 4 samples/GPU"
+echo "Validation: built-in nuScenes evaluation after epoch 24"
+nvidia-smi
+
+echo "Validating the URoPE model construction before training."
+python tools/smoke_test_urope.py --config "$CONFIG"
+
+echo "Starting 24-epoch training with built-in validation at epoch 24."
+PORT="$TRAIN_PORT" bash tools/dist_train.sh \
+    "$CONFIG" \
+    "$NUM_TRAIN_GPUS" \
+    --work-dir "$OUTPUT_DIR" \
+    --seed "$SEED"
+
+CHECKPOINT="$OUTPUT_DIR/epoch_24.pth"
+if [[ ! -f "$CHECKPOINT" ]]; then
+    echo "Training finished without the expected checkpoint: $CHECKPOINT" >&2
+    exit 1
+fi
+
+echo "Training and built-in epoch-24 validation completed successfully."
+echo "Checkpoint: $CHECKPOINT"
+echo "Training and validation log directory: $OUTPUT_DIR"
