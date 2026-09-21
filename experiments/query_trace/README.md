@@ -99,6 +99,37 @@ computes the Jensen-Shannon divergence between full attention and attention
 with that logit component removed, averages it across heads, and normalizes the
 six impacts to 100% independently for each query and layer.
 
+## Optional per-head camera-attention visualization
+
+Plot the final decoder layer as one comparison canvas:
+
+```bash
+python experiments/query_trace/trace_query.py \
+  --scene-name scene-0101 \
+  --scene-frame-index 28 \
+  --query-indices 127 \
+  --plot-per-head-attention
+```
+
+The default is decoder layer 6. Select one or more one-based layers with, for
+example:
+
+```text
+--plot-per-head-attention --per-head-layers 3 6
+```
+
+Each selected layer produces
+`query_<index>_<class>/per_head_attention_L<layer>.png`. The canvas has nine
+rows (head average followed by heads 1 through 8) and one column for each
+camera. All panels use a shared 99.5-percentile attention scale. Each panel
+reports that head's attention mass assigned to the camera and overlays the GT
+box, predicted box, query reference, predicted center, and GT center.
+
+Every head is independently softmax-normalized over all image tokens and sums
+to one. Therefore, this canvas compares spatial concentration and allocation
+across cameras; it does not by itself measure how strongly one head contributes
+to the final decoder output.
+
 ## Optional BEV ray-attention visualization
 
 Plot the final decoder layer's 200 highest-attention image-token rays in the
@@ -132,12 +163,17 @@ The title reports the matched GT class and that decoder layer's predicted
 class.
 Because a PETR image token represents a sampled camera ray rather than one
 depth, the plot shows attended 3D directions and does not claim a unique
-attended 3D point.
+attended 3D point. Ray back-projection uses the centre of each feature cell,
+`u=(column+0.5)*image_width/feature_width` and
+`v=(row+0.5)*image_height/feature_height`, rather than the cell boundary.
 
 The tracer runs PETR twice on cached image features: once to choose or verify
 the final matches and once with diagnostic attention capture. It checks that
 both model outputs agree and validates the diagnostic attention against the
-original cross-attention output.
+original cross-attention output. For URoPE, validation reconstructs all 900
+queries with the native batch/head tensor shapes before selecting the requested
+queries. This avoids shape-dependent CUDA rounding differences while retaining
+the strict replay check.
 
 ## nuScenes URoPE trace
 
@@ -154,6 +190,8 @@ python experiments/query_trace/trace_query.py \
   --gt-indices 57 \
   --dataset-name nuScenes-URoPE \
   --output-dir experiments/query_trace/outputs/nuscenes_urope \
+  --plot-per-head-attention \
+  --per-head-layers 6 \
   --plot-bev-rays \
   --bev-ray-layers 1 2 3 4 5 6
 ```

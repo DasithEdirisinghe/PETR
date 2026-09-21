@@ -94,6 +94,12 @@ def parse_args():
                         help='One-based decoder layers for BEV ray plots.')
     parser.add_argument('--bev-ray-top-k', type=int, default=200,
                         help='Number of highest-attention rays to draw per plot.')
+    parser.add_argument('--plot-per-head-attention', action='store_true',
+                        help='Plot average and per-head camera attention for '
+                             'the selected decoder layers.')
+    parser.add_argument('--per-head-layers', nargs='+', type=int, default=[6],
+                        help='One-based decoder layers for per-head attention '
+                             'plots (default: 6).')
     return parser.parse_args()
 
 
@@ -459,8 +465,9 @@ def install_attention_trace(head, query_indices, records, image_3d_pe,
                          None if bias is None else bias[dims:2*dims])
             v = F.linear(value, weight[2*dims:],
                          None if bias is None else bias[2*dims:])
-            q_selected_unrotated = q[query_indices, 0].view(
-                len(query_indices), heads, head_dim).transpose(0, 1)
+            q_heads_unrotated = q[:, 0].view(
+                q.shape[0], heads, head_dim).transpose(0, 1)
+            q_selected_unrotated = q_heads_unrotated[:, query_indices]
             k_heads_unrotated = k[:, 0].view(
                 k.shape[0], heads, head_dim).transpose(0, 1)
             v_heads = v[:, 0].view(v.shape[0], heads, head_dim).transpose(0, 1)
@@ -468,17 +475,30 @@ def install_attention_trace(head, query_indices, records, image_3d_pe,
                 if urope_query_points is None or urope_key_points is None:
                     raise ValueError('URoPE trace requires query/key 3D points')
                 selected_points = urope_query_points[:, query_indices]
-                q_selected = apply_urope_3d(
-                    q_selected_unrotated.unsqueeze(0), selected_points,
-                    this.urope_freq_base, this.urope_freq_scale)[0]
-                k_heads = apply_urope_3d(
+                # Reconstruct all queries before selecting the traced subset.
+                # Keeping the same GEMM shapes as the native URoPE path avoids
+                # CUDA/TF32 rounding changes caused by multiplying only a few
+                # selected queries.
+                q_heads_batched = apply_urope_3d(
+                    q_heads_unrotated.unsqueeze(0), urope_query_points,
+                    this.urope_freq_base, this.urope_freq_scale)
+                q_heads = q_heads_batched[0]
+                q_selected = q_heads[:, query_indices]
+                k_heads_batched = apply_urope_3d(
                     k_heads_unrotated.unsqueeze(0), urope_key_points,
-                    this.urope_freq_base, this.urope_freq_scale)[0]
+                    this.urope_freq_base, this.urope_freq_scale)
+                k_heads = k_heads_batched[0]
             else:
                 q_selected = q_selected_unrotated
                 k_heads = k_heads_unrotated
-            logits = torch.matmul(q_selected, k_heads.transpose(-2, -1))
-            logits = logits / math.sqrt(head_dim)
+            if is_urope:
+                logits_all = torch.matmul(
+                    q_heads_batched, k_heads_batched.transpose(-2, -1))
+                logits_all = logits_all / math.sqrt(head_dim)
+                logits = logits_all[0, :, query_indices]
+            else:
+                logits = torch.matmul(q_selected, k_heads.transpose(-2, -1))
+                logits = logits / math.sqrt(head_dim)
             if attention_mask is not None:
                 selected_mask = attention_mask
                 if selected_mask.dim() == 2:
@@ -496,6 +516,29 @@ def install_attention_trace(head, query_indices, records, image_3d_pe,
                 logits = logits.masked_fill(
                     padding_mask[0][None, None].bool(), float('-inf'))
             attention = F.softmax(logits.float(), dim=-1).to(q.dtype)
+
+            # Use the full-query URoPE tensors for the replay check as well.
+            # The selected attention remains the tensor saved and visualized.
+            if is_urope:
+                if attention_mask is not None:
+                    full_mask = attention_mask
+                    if full_mask.dim() == 2:
+                        full_mask = full_mask[None, None]
+                    elif full_mask.dim() == 3:
+                        full_mask = full_mask.view(
+                            -1, heads, full_mask.shape[-2],
+                            full_mask.shape[-1])[0]
+                    if full_mask.dtype in (torch.bool, torch.uint8):
+                        logits_all = logits_all.masked_fill(
+                            full_mask.bool(), float('-inf'))
+                    else:
+                        logits_all = logits_all + full_mask
+                if padding_mask is not None:
+                    logits_all = logits_all.masked_fill(
+                        padding_mask[0][None, None].bool(), float('-inf'))
+                attention_all = F.softmax(
+                    logits_all.float(), dim=-1).to(q.dtype)
+                attention = attention_all[0, :, query_indices]
 
             q_content = F.linear(query, weight[:dims], None)
             q_position = F.linear(query_pos, weight[:dims], None)
@@ -564,9 +607,20 @@ def install_attention_trace(head, query_indices, records, image_3d_pe,
             impact_stack = torch.stack(list(component_impacts.values()), dim=0)
             impact_percent = 100.0 * impact_stack / impact_stack.sum(
                 dim=0, keepdim=True).clamp_min(1e-12)
-            replay = torch.matmul(attention, v_heads).transpose(0, 1).reshape(
-                len(query_indices), dims)
-            replay = this.attn.out_proj(replay) + identity[query_indices, 0]
+            if is_urope:
+                replay_all = torch.matmul(
+                    attention_all,
+                    v_heads.unsqueeze(0)).transpose(1, 2).contiguous()
+                replay_all = replay_all.view(1, q.shape[0], dims).transpose(0, 1)
+                replay_all = this.attn.out_proj(replay_all)
+                replay = (replay_all[query_indices, 0] +
+                          identity[query_indices, 0])
+            else:
+                replay = torch.matmul(
+                    attention, v_heads).transpose(0, 1).reshape(
+                        len(query_indices), dims)
+                replay = (this.attn.out_proj(replay) +
+                          identity[query_indices, 0])
             manual_difference = float(
                 (replay - result[query_indices, 0]).abs().max())
 
@@ -875,6 +929,117 @@ def render_target(target_name, target_position, traces, outputs, gt_boxes,
                 np.concatenate((header, canvas), axis=0))
 
 
+def render_layer_per_head(target_name, target, traces, outputs, gt_boxes,
+                          reference_xyz, annotation, images, img_metas,
+                          feature_shape, class_names, output_dir,
+                          layer_number):
+    """Render average plus every attention head against all camera views."""
+    cameras, feat_h, feat_w = feature_shape
+    layer_index = layer_number - 1
+    trace = traces[layer_index]
+    query = target['query_index']
+    slot = target['trace_slot']
+    projections = img_metas[0]['lidar2img']
+    camera_names = img_metas[0].get(
+        'camera_names', ['CAM_{}'.format(i) for i in range(cameras)])
+
+    per_head = trace['attention'][:, slot].numpy().reshape(
+        -1, cameras, feat_h, feat_w)
+    maps = np.concatenate((per_head.mean(axis=0, keepdims=True), per_head),
+                          axis=0)
+    shared_scale = max(float(np.percentile(maps, 99.5)), 1e-12)
+
+    box_template = annotation['gt_bboxes_3d']
+    gt_tensor = gt_boxes[target['gt_index']].detach().cpu().clone()
+    gt_center = gt_tensor[:3].numpy().copy()
+    gt_tensor[2] -= gt_tensor[5] * 0.5
+    gt_corners = box_template.new_box(
+        gt_tensor.unsqueeze(0)).corners[0].numpy()
+
+    decoded = denormalize_bbox(
+        outputs['all_bbox_preds'][layer_index, 0, query:query + 1], None)
+    predicted_tensor = decoded.detach().cpu().clone()
+    predicted_center = predicted_tensor[0, :3].numpy().copy()
+    predicted_tensor[:, 2] -= predicted_tensor[:, 5] * 0.5
+    predicted_corners = box_template.new_box(
+        predicted_tensor).corners[0].numpy()
+    reference_center = np.asarray(reference_xyz, dtype=np.float32)
+    predicted_label = int(outputs['all_cls_scores'][
+        layer_index, 0, query].sigmoid().argmax())
+
+    tile_width = 360
+    tile_height = int(round(images[0].shape[0] * tile_width /
+                            images[0].shape[1]))
+    row_label_width = 150
+    column_header_height = 52
+    header = np.full(
+        (column_header_height, row_label_width + cameras * tile_width, 3),
+        (24, 31, 43), dtype=np.uint8)
+    title = ('Decoder L{} | query {} | GT: {} | Pred: {} | shared 99.5% '
+             'attention scale').format(
+                 layer_index + 1, query, target['gt_class'],
+                 class_names[predicted_label])
+    cv2.putText(header, title, (12, 22), cv2.FONT_HERSHEY_SIMPLEX,
+                0.55, (225, 232, 240), 1, cv2.LINE_AA)
+    for camera, camera_name in enumerate(camera_names):
+        x = row_label_width + camera * tile_width + 8
+        cv2.putText(header, camera_name, (x, 45),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.48,
+                    (255, 255, 255), 1, cv2.LINE_AA)
+
+    rows = []
+    for map_index, attention in enumerate(maps):
+        row_name = 'AVERAGE' if map_index == 0 else 'HEAD {}'.format(map_index)
+        label_panel = np.full(
+            (tile_height, row_label_width, 3), (24, 31, 43), dtype=np.uint8)
+        cv2.putText(label_panel, row_name, (12, 32),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.56,
+                    (255, 255, 255), 1, cv2.LINE_AA)
+        cv2.putText(label_panel, 'sum=1/head' if map_index else 'mean heads',
+                    (12, 58), cv2.FONT_HERSHEY_SIMPLEX, 0.40,
+                    (175, 190, 210), 1, cv2.LINE_AA)
+        tiles = []
+        camera_mass = attention.reshape(cameras, -1).sum(axis=1)
+        for camera in range(cameras):
+            base = images[camera]
+            heat = cv2.resize(
+                attention[camera], (base.shape[1], base.shape[0]),
+                interpolation=cv2.INTER_LINEAR)
+            heat = np.clip(heat / shared_scale, 0.0, 1.0)
+            color = cv2.applyColorMap(
+                (heat * 255).astype(np.uint8), cv2.COLORMAP_TURBO)
+            overlay = cv2.addWeighted(base, 0.58, color, 0.42, 0)
+            overlay = draw_box(
+                overlay, gt_corners, projections[camera], color=(40, 40, 255))
+            overlay = draw_box(
+                overlay, predicted_corners, projections[camera],
+                color=(70, 255, 70))
+            draw_projected_point(
+                overlay, reference_center, projections[camera], 'circle',
+                (255, 255, 0))
+            draw_projected_point(
+                overlay, predicted_center, projections[camera], 'cross',
+                (0, 255, 255))
+            draw_projected_point(
+                overlay, gt_center, projections[camera], 'diamond',
+                (255, 0, 255))
+            cv2.putText(
+                overlay, 'mass={:.3f}'.format(camera_mass[camera]),
+                (10, 26), cv2.FONT_HERSHEY_SIMPLEX, 0.58,
+                (255, 255, 255), 2, cv2.LINE_AA)
+            tiles.append(cv2.resize(
+                overlay, (tile_width, tile_height),
+                interpolation=cv2.INTER_AREA))
+        rows.append(np.concatenate([label_panel] + tiles, axis=1))
+
+    target_dir = output_dir / target_name
+    target_dir.mkdir(parents=True, exist_ok=True)
+    cv2.imwrite(
+        str(target_dir / 'per_head_attention_L{:02d}.png'.format(
+            layer_index + 1)),
+        np.concatenate([header] + rows, axis=0))
+
+
 def serializable_targets(targets, outputs, gt_boxes, classes,
                          metric_references, traces):
     result = {}
@@ -987,8 +1152,10 @@ def render_bev_rays(target_name, target, traces, outputs, gt_boxes,
             camera = int(flat_index // (height * width))
             spatial = int(flat_index % (height * width))
             row, column = divmod(spatial, width)
-            u = column * float(pad_w) / width
-            v = row * float(pad_h) / height
+            # A flattened key represents a feature cell, so back-project its
+            # centre rather than its upper-left boundary.
+            u = (column + 0.5) * float(pad_w) / width
+            v = (row + 0.5) * float(pad_h) / height
             inverse = np.linalg.inv(np.asarray(projections[camera]))
             origin_h = inverse @ np.asarray([0.0, 0.0, 0.0, 1.0])
             far_h = inverse @ np.asarray(
@@ -1109,6 +1276,10 @@ def main():
                       if layer < 1 or layer > 6]
     if invalid_layers:
         raise ValueError('--bev-ray-layers must contain values from 1 to 6')
+    invalid_per_head_layers = [
+        layer for layer in args.per_head_layers if layer < 1 or layer > 6]
+    if invalid_per_head_layers:
+        raise ValueError('--per-head-layers must contain values from 1 to 6')
     os.chdir(str(REPO_ROOT))
     cfg = Config.fromfile(args.config)
     import_plugin(cfg)
@@ -1245,6 +1416,15 @@ def main():
             metric_references[target['trace_slot']].detach().cpu().numpy(),
             annotation, images, img_metas, (num_cams, feat_h, feat_w),
             class_names, output_dir)
+        if args.plot_per_head_attention:
+            for layer_number in args.per_head_layers:
+                render_layer_per_head(
+                    name, target, traces, baseline, gt_boxes,
+                    metric_references[
+                        target['trace_slot']].detach().cpu().numpy(),
+                    annotation, images, img_metas,
+                    (num_cams, feat_h, feat_w), class_names, output_dir,
+                    layer_number)
         if args.plot_bev_rays:
             render_bev_rays(
                 name, target, traces, baseline, gt_boxes,
@@ -1271,6 +1451,11 @@ def main():
             'enabled': args.plot_bev_rays,
             'layers': args.bev_ray_layers,
             'top_k': args.bev_ray_top_k,
+        },
+        'per_head_attention_visualization': {
+            'enabled': args.plot_per_head_attention,
+            'layers': args.per_head_layers,
+            'layout': 'rows=average+heads, columns=cameras',
         },
         'manual_attention_replay_max_abs_error': max_manual_error,
         'native_attention_replay_max_abs_error': max_native_error,
