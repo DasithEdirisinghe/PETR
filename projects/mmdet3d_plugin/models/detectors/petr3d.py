@@ -190,12 +190,17 @@ class Petr3D(MVXTwoStageDetector):
         return self.simple_test(
             img_metas[0], img[0], points=points, **kwargs)
 
-    def simple_test_pts(self, x, img_metas, rescale=False, points=None):
+    def simple_test_pts(self, x, img_metas, rescale=False, points=None,
+                        reference_points_override=None):
         """Test function of point cloud branch."""
         if getattr(self.pts_bbox_head, 'with_lidar_oracle', False):
-            outs = self.pts_bbox_head(x, img_metas, points=points)
+            outs = self.pts_bbox_head(
+                x, img_metas, points=points,
+                reference_points_override=reference_points_override)
         else:
-            outs = self.pts_bbox_head(x, img_metas)
+            outs = self.pts_bbox_head(
+                x, img_metas,
+                reference_points_override=reference_points_override)
         bbox_list = self.pts_bbox_head.get_bboxes(
             outs, img_metas, rescale=rescale)
         bbox_results = [
@@ -204,13 +209,15 @@ class Petr3D(MVXTwoStageDetector):
         ]
         return bbox_results
 
-    def simple_test(self, img_metas, img=None, rescale=False, points=None):
+    def simple_test(self, img_metas, img=None, rescale=False, points=None,
+                    reference_points_override=None):
         """Test function without augmentaiton."""
         img_feats = self.extract_feat(img=img, img_metas=img_metas)
 
         bbox_list = [dict() for i in range(len(img_metas))]
         bbox_pts = self.simple_test_pts(
-            img_feats, img_metas, rescale=rescale, points=points)
+            img_feats, img_metas, rescale=rescale, points=points,
+            reference_points_override=reference_points_override)
         for result_dict, pts_bbox in zip(bbox_list, bbox_pts):
             result_dict['pts_bbox'] = pts_bbox
         return bbox_list

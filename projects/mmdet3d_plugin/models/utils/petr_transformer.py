@@ -92,8 +92,15 @@ class PETRTransformer(BaseModule):
         bs, n, c, h, w = x.shape
         memory = x.permute(1, 3, 4, 0, 2).reshape(-1, bs, c) # [bs, n, c, h, w] -> [n*h*w, bs, c]
         pos_embed = pos_embed.permute(1, 3, 4, 0, 2).reshape(-1, bs, c) # [bs, n, c, h, w] -> [n*h*w, bs, c]
-        query_embed = query_embed.unsqueeze(1).repeat(
-            1, bs, 1)  # [num_query, dim] -> [num_query, bs, dim]
+        if query_embed.dim() == 2:
+            query_embed = query_embed.unsqueeze(1).repeat(
+                1, bs, 1)  # [num_query, dim] -> [num_query, bs, dim]
+        elif query_embed.dim() == 3:
+            if query_embed.size(0) != bs:
+                raise ValueError('Batch-specific query embeddings have an invalid batch size')
+            query_embed = query_embed.permute(1, 0, 2).contiguous()
+        else:
+            raise ValueError('query_embed must have shape [Q,C] or [B,Q,C]')
         mask = mask.view(bs, -1)  # [bs, n, h, w] -> [bs, n*h*w]
         target = torch.zeros_like(query_embed)
 

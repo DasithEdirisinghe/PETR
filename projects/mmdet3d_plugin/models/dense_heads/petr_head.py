@@ -455,7 +455,8 @@ class PETRHead(AnchorFreeHead):
                                           strict, missing_keys,
                                           unexpected_keys, error_msgs)
     
-    def forward(self, mlvl_feats, img_metas, points=None):
+    def forward(self, mlvl_feats, img_metas, points=None,
+                reference_points_override=None):
         """Forward function.
         Args:
             mlvl_feats (tuple[Tensor]): Features from the upstream
@@ -542,9 +543,39 @@ class PETRHead(AnchorFreeHead):
                     pos_embeds.append(pos_embed.unsqueeze(1))
                 pos_embed = torch.cat(pos_embeds, 1)
 
-        reference_points = self.reference_points.weight
-        query_embeds = self.query_embedding(pos2posemb3d(reference_points))
-        reference_points = reference_points.unsqueeze(0).repeat(batch_size, 1, 1) #.sigmoid()
+        if reference_points_override is None:
+            # Preserve the original PETR path exactly when no oracle override
+            # is requested.
+            reference_points = self.reference_points.weight
+            query_embeds = self.query_embedding(
+                pos2posemb3d(reference_points))
+            reference_points = reference_points.unsqueeze(0).repeat(
+                batch_size, 1, 1)
+        elif reference_points_override.dim() == 2:
+            reference_points = reference_points_override
+            if reference_points.shape != self.reference_points.weight.shape:
+                raise ValueError(
+                    'reference_points_override must have shape [Q,3]')
+            reference_points = reference_points.unsqueeze(0).repeat(
+                batch_size, 1, 1)
+            reference_points = reference_points.to(
+                device=x.device, dtype=self.reference_points.weight.dtype)
+            query_embeds = self.query_embedding(
+                pos2posemb3d(reference_points))
+        elif reference_points_override.dim() == 3:
+            reference_points = reference_points_override
+            expected = (batch_size, self.num_query, 3)
+            if tuple(reference_points.shape) != expected:
+                raise ValueError(
+                    'reference_points_override must have shape {}, got {}'.format(
+                        expected, tuple(reference_points.shape)))
+            reference_points = reference_points.to(
+                device=x.device, dtype=self.reference_points.weight.dtype)
+            query_embeds = self.query_embedding(
+                pos2posemb3d(reference_points))
+        else:
+            raise ValueError(
+                'reference_points_override must have shape [Q,3] or [B,Q,3]')
 
         urope_query_points = None
         urope_key_points = None

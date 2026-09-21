@@ -36,6 +36,7 @@ if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
 from projects.mmdet3d_plugin.core.bbox.util import denormalize_bbox  # noqa: E402
+from projects.mmdet3d_plugin.models.utils.urope import apply_urope_3d  # noqa: E402
 
 
 EDGES = ((0, 1), (1, 2), (2, 3), (3, 0),
@@ -58,6 +59,14 @@ def parse_args():
                         help='Zero-based keyframe index within --scene-name.')
     parser.add_argument('--sample-index', type=int, default=None)
     parser.add_argument('--sample-token', default=None)
+    parser.add_argument('--data-root', default=None,
+                        help='Override cfg.data.test.data_root (for example data/pccr/R1-f/).')
+    parser.add_argument('--ann-file', default=None,
+                        help='Override cfg.data.test.ann_file.')
+    parser.add_argument('--dataset-name', default=None,
+                        help='Optional rig/dataset label recorded in trace metadata.')
+    parser.add_argument('--run-label', default=None,
+                        help='Use this output subdirectory instead of the sample token.')
     parser.add_argument('--output-dir', default=str(
         REPO_ROOT / 'experiments/query_trace/outputs'))
     parser.add_argument('--score-threshold', type=float, default=0.35)
@@ -67,6 +76,14 @@ def parse_args():
                         help='Write matched-query precheck tables and exit.')
     parser.add_argument('--query-indices', nargs='+', type=int, default=None,
                         help='Trace these exact final-layer query indices.')
+    parser.add_argument('--gt-indices', nargs='+', type=int, default=None,
+                        help='Trace queries assigned to these zero-based GT indices.')
+    parser.add_argument('--match-targets-from', default=None,
+                        help='Trace the same physical GT objects as a previous '
+                             'trace_summary.json, matched by class and 3D center.')
+    parser.add_argument('--max-gt-match-distance', type=float, default=0.25,
+                        help='Maximum 3D center distance in metres when matching '
+                             '--match-targets-from (default: 0.25).')
     parser.add_argument('--clean-error', type=float, default=1.0)
     parser.add_argument('--poor-error', type=float, default=2.0)
     parser.add_argument('--max-poor-error', type=float, default=4.0)
@@ -117,7 +134,12 @@ def resolve_sample(dataset, args):
             raise ValueError('Use either scene/frame or sample index/token, not both')
         if args.scene_frame_index < 0:
             raise ValueError('--scene-frame-index is zero-based and must be >= 0')
-        table_root = Path(dataset.data_root) / 'v1.0-trainval'
+        version = getattr(dataset, 'version', None) or 'v1.0-trainval'
+        table_root = Path(dataset.data_root) / version
+        if not (table_root / 'sample.json').is_file():
+            raise FileNotFoundError(
+                'Scene-based selection requires sample.json and scene.json '
+                'under {}'.format(table_root))
         with open(str(table_root / 'sample.json'), 'r') as handle:
             samples = {row['token']: row for row in json.load(handle)}
         with open(str(table_root / 'scene.json'), 'r') as handle:
@@ -215,7 +237,12 @@ def query_candidates(head, outputs, gt_boxes, gt_labels, class_names,
     return candidates
 
 
-def choose_queries(candidates, args):
+def choose_queries(candidates, args, gt_boxes, class_names):
+    selection_modes = sum(bool(value) for value in (
+        args.query_indices, args.gt_indices, args.match_targets_from))
+    if selection_modes > 1:
+        raise ValueError('Use only one of --query-indices, --gt-indices, or '
+                         '--match-targets-from')
     if args.query_indices:
         by_query = {row['query_index']: row for row in candidates}
         missing = [query for query in args.query_indices if query not in by_query]
@@ -224,6 +251,53 @@ def choose_queries(candidates, args):
                 'Requested queries are not final-layer Hungarian matches in '
                 'the selected class set: {}'.format(missing))
         selected = [dict(by_query[query]) for query in args.query_indices]
+    elif args.gt_indices:
+        by_gt = {row['gt_index']: row for row in candidates}
+        missing = [gt for gt in args.gt_indices if gt not in by_gt]
+        if missing:
+            raise ValueError(
+                'No final-layer Hungarian-matched query for GT indices: {}'.format(
+                    missing))
+        selected = [dict(by_gt[gt]) for gt in args.gt_indices]
+    elif args.match_targets_from:
+        with open(args.match_targets_from, 'r') as handle:
+            source = json.load(handle)
+        source_targets = source.get('targets', {})
+        if not source_targets:
+            raise ValueError('Source trace contains no targets: {}'.format(
+                args.match_targets_from))
+        by_gt = {row['gt_index']: row for row in candidates}
+        selected = []
+        used_gt = set()
+        for source_name, source_target in source_targets.items():
+            class_name = source_target.get(
+                'gt_class', source_target.get('class_name'))
+            if class_name not in class_names:
+                raise ValueError('Source target has unknown class: {}'.format(
+                    class_name))
+            class_id = class_names.index(class_name)
+            source_center = gt_boxes.new_tensor(source_target['gt_box'][:3])
+            distances = torch.norm(gt_boxes[:, :3] - source_center[None], dim=1)
+            valid = [index for index in range(len(gt_boxes))
+                     if int(index) not in used_gt and
+                     int(index) in by_gt and
+                     by_gt[int(index)]['gt_label'] == class_id]
+            if not valid:
+                raise ValueError('No matched {} GT is available for source target '
+                                 '{}'.format(class_name, source_name))
+            gt_index = min(valid, key=lambda index: float(distances[index]))
+            distance = float(distances[gt_index])
+            if distance > args.max_gt_match_distance:
+                raise ValueError(
+                    'Nearest {} GT for {} is {:.3f} m away (limit {:.3f} m). '
+                    'This likely is not the same synchronized frame/object.'.format(
+                        class_name, source_name, distance,
+                        args.max_gt_match_distance))
+            row = dict(by_gt[gt_index])
+            row['source_target_name'] = source_name
+            row['cross_rig_gt_center_distance_m'] = distance
+            selected.append(row)
+            used_gt.add(gt_index)
     else:
         eligible = [row for row in candidates
                     if row['class_correct'] and row['above_score_threshold']]
@@ -243,7 +317,12 @@ def choose_queries(candidates, args):
 
     targets = {}
     for slot, row in enumerate(selected):
-        name = 'query_{:04d}_{}'.format(row['query_index'], row['gt_class'])
+        local_name = 'query_{:04d}_{}'.format(
+            row['query_index'], row['gt_class'])
+        if 'source_target_name' in row:
+            name = 'same_{}__{}'.format(row['source_target_name'], local_name)
+        else:
+            name = local_name
         if name in targets:
             raise ValueError('Duplicate query index requested: {}'.format(
                 row['query_index']))
@@ -253,7 +332,8 @@ def choose_queries(candidates, args):
 
 
 def write_query_precheck(output_dir, candidates, sample_token, dataset_index,
-                         score_threshold, selected_classes):
+                         score_threshold, selected_classes,
+                         model_metadata=None):
     output_dir.mkdir(parents=True, exist_ok=True)
     csv_path = output_dir / 'query_candidates.csv'
     if candidates:
@@ -267,6 +347,7 @@ def write_query_precheck(output_dir, candidates, sample_token, dataset_index,
             'dataset_index': dataset_index,
             'score_threshold': score_threshold,
             'selected_classes': selected_classes,
+            'model': model_metadata or {},
             'queries': candidates,
         }, handle, indent=2)
     return csv_path
@@ -278,10 +359,7 @@ def tensor_cpu(value, half=False):
 
 
 def position_components(head, features, img_metas):
-    """Reconstruct PETR's separate learned-3D and multiview PE tensors."""
-    if head.position_embedding_mode != 'petr' or not head.with_position:
-        raise NotImplementedError(
-            'Component decomposition currently requires vanilla PETR 3DPE')
+    """Reconstruct the additive image PE tensors used by the PETR head."""
     feature = features[0]
     batch, cameras = feature.shape[:2]
     input_h, input_w, _ = img_metas[0]['pad_shape'][0]
@@ -292,12 +370,20 @@ def position_components(head, features, img_metas):
             masks[batch_index, camera, :image_h, :image_w] = 0
     projected_shape = head.input_proj(feature.flatten(0, 1)).shape[-2:]
     masks = F.interpolate(masks, size=projected_shape).to(torch.bool)
-    learned_3d, _ = head.position_embeding(features, img_metas, masks)
-    if head.with_multiview:
+    if head.position_embedding_mode == 'petr' and head.with_position:
+        learned_3d, _ = head.position_embeding(features, img_metas, masks)
+    else:
+        learned_3d = torch.zeros_like(head.input_proj(
+            feature.flatten(0, 1))).view(
+                batch, cameras, head.embed_dims, *projected_shape)
+    use_multiview = head.with_multiview and not (
+        head.position_embedding_mode == 'urope' and
+        not head.urope_with_multiview_pe)
+    if use_multiview:
         multiview = head.positional_encoding(masks)
         multiview = head.adapt_pos3d(multiview.flatten(0, 1)).view(
             batch, cameras, head.embed_dims, *projected_shape)
-    else:
+    elif head.position_embedding_mode == 'petr':
         per_camera = []
         for camera in range(cameras):
             encoded = head.positional_encoding(masks[:, camera])
@@ -305,6 +391,8 @@ def position_components(head, features, img_metas):
         multiview = torch.cat(per_camera, dim=1)
         multiview = head.adapt_pos3d(multiview.flatten(0, 1)).view(
             batch, cameras, head.embed_dims, *projected_shape)
+    else:
+        multiview = torch.zeros_like(learned_3d)
     return learned_3d, multiview
 
 
@@ -329,8 +417,7 @@ def install_attention_trace(head, query_indices, records, image_3d_pe,
     originals = []
     for layer_index, layer in enumerate(head.transformer.decoder.layers):
         module = layer.attentions[1]
-        if getattr(module, 'urope', False):
-            raise NotImplementedError('This baseline tracer targets vanilla PETR attention')
+        is_urope = getattr(module, 'urope', False)
         original = module.forward
         originals.append((module, original))
 
@@ -355,12 +442,15 @@ def install_attention_trace(head, query_indices, records, image_3d_pe,
                 'attn_mask', call_args[6] if len(call_args) > 6 else None)
             padding_mask = call_kwargs.get(
                 'key_padding_mask', call_args[7] if len(call_args) > 7 else None)
+            urope_query_points = call_kwargs.get('urope_query_points')
+            urope_key_points = call_kwargs.get('urope_key_points')
             result = _original(*call_args, **call_kwargs)
 
             q_input = query if query_pos is None else query + query_pos
             k_input = key if key_pos is None else key + key_pos
+            expected_key_pos = image_3d_pe + image_multiview_pe
             position_split_error = float(
-                (key_pos - image_3d_pe - image_multiview_pe).abs().max())
+                (key_pos - expected_key_pos).abs().max())
             dims, heads = this.embed_dims, this.num_heads
             head_dim = dims // heads
             weight, bias = this.attn.in_proj_weight, this.attn.in_proj_bias
@@ -369,10 +459,24 @@ def install_attention_trace(head, query_indices, records, image_3d_pe,
                          None if bias is None else bias[dims:2*dims])
             v = F.linear(value, weight[2*dims:],
                          None if bias is None else bias[2*dims:])
-            q_selected = q[query_indices, 0].view(len(query_indices), heads,
-                                                  head_dim).transpose(0, 1)
-            k_heads = k[:, 0].view(k.shape[0], heads, head_dim).transpose(0, 1)
+            q_selected_unrotated = q[query_indices, 0].view(
+                len(query_indices), heads, head_dim).transpose(0, 1)
+            k_heads_unrotated = k[:, 0].view(
+                k.shape[0], heads, head_dim).transpose(0, 1)
             v_heads = v[:, 0].view(v.shape[0], heads, head_dim).transpose(0, 1)
+            if is_urope:
+                if urope_query_points is None or urope_key_points is None:
+                    raise ValueError('URoPE trace requires query/key 3D points')
+                selected_points = urope_query_points[:, query_indices]
+                q_selected = apply_urope_3d(
+                    q_selected_unrotated.unsqueeze(0), selected_points,
+                    this.urope_freq_base, this.urope_freq_scale)[0]
+                k_heads = apply_urope_3d(
+                    k_heads_unrotated.unsqueeze(0), urope_key_points,
+                    this.urope_freq_base, this.urope_freq_scale)[0]
+            else:
+                q_selected = q_selected_unrotated
+                k_heads = k_heads_unrotated
             logits = torch.matmul(q_selected, k_heads.transpose(-2, -1))
             logits = logits / math.sqrt(head_dim)
             if attention_mask is not None:
@@ -414,9 +518,23 @@ def install_attention_trace(head, query_indices, records, image_3d_pe,
             }
             key_parts = {
                 'X': all_key_heads(k_content),
-                'G3D': all_key_heads(k_3d),
                 'GMV': all_key_heads(k_multiview),
             }
+            if not is_urope:
+                key_parts['G3D'] = all_key_heads(k_3d)
+            else:
+                query_parts = {
+                    name: apply_urope_3d(
+                        value.unsqueeze(0), selected_points,
+                        this.urope_freq_base, this.urope_freq_scale)[0]
+                    for name, value in query_parts.items()
+                }
+                key_parts = {
+                    name: apply_urope_3d(
+                        value.unsqueeze(0), urope_key_points,
+                        this.urope_freq_base, this.urope_freq_scale)[0]
+                    for name, value in key_parts.items()
+                }
             component_logits = {}
             component_impacts = {}
             for query_name, query_part in query_parts.items():
@@ -432,6 +550,17 @@ def install_attention_trace(head, query_indices, records, image_3d_pe,
                     # Mean JS over heads, independently for each traced query.
                     component_impacts[component_name] = js_divergence(
                         attention, alternative).mean(dim=0)
+            if is_urope:
+                unrotated_logits = torch.matmul(
+                    q_selected_unrotated,
+                    k_heads_unrotated.transpose(-2, -1)) / math.sqrt(head_dim)
+                if padding_mask is not None:
+                    unrotated_logits = unrotated_logits.masked_fill(
+                        padding_mask[0][None, None].bool(), float('-inf'))
+                unrotated_attention = F.softmax(
+                    unrotated_logits.float(), dim=-1).to(q.dtype)
+                component_impacts['URoPE'] = js_divergence(
+                    attention, unrotated_attention).mean(dim=0)
             impact_stack = torch.stack(list(component_impacts.values()), dim=0)
             impact_percent = 100.0 * impact_stack / impact_stack.sum(
                 dim=0, keepdim=True).clamp_min(1e-12)
@@ -445,18 +574,23 @@ def install_attention_trace(head, query_indices, records, image_3d_pe,
             # weights. This is the strict compatibility check on older PETR
             # environments; the explicit per-head calculation remains the
             # source of the head-resolved tensors saved below.
-            native_out, native_attention = this.attn(
-                query=q_input, key=k_input, value=value,
-                attn_mask=attention_mask, key_padding_mask=padding_mask)
-            native_replay = native_out[query_indices, 0] + identity[
-                query_indices, 0]
-            native_difference = float(
-                (native_replay - result[query_indices, 0]).abs().max())
-            native_selected = native_attention[0, query_indices]
-            attention_difference = float(
-                (attention.mean(dim=0) - native_selected).abs().max())
+            if is_urope:
+                native_difference = manual_difference
+                attention_difference = 0.0
+            else:
+                native_out, native_attention = this.attn(
+                    query=q_input, key=k_input, value=value,
+                    attn_mask=attention_mask, key_padding_mask=padding_mask)
+                native_replay = native_out[query_indices, 0] + identity[
+                    query_indices, 0]
+                native_difference = float(
+                    (native_replay - result[query_indices, 0]).abs().max())
+                native_selected = native_attention[0, query_indices]
+                attention_difference = float(
+                    (attention.mean(dim=0) - native_selected).abs().max())
             records.append({
                 'layer': _layer + 1,
+                'attention_mode': 'urope' if is_urope else 'petr',
                 'h': tensor_cpu(query[query_indices, 0]),
                 'query_pe': tensor_cpu(query_pos[query_indices, 0]),
                 'projected_q': tensor_cpu(q_selected),
@@ -719,17 +853,22 @@ def render_target(target_name, target_position, traces, outputs, gt_boxes,
     cv2.putText(header, 'Distances: BEV metres', (600, legend_y + 2),
                 cv2.FONT_HERSHEY_SIMPLEX, 0.58, (210, 220, 235), 1,
                 cv2.LINE_AA)
-    cv2.putText(
-        header,
+    impact_names = list(traces[0]['component_impact_percent'])
+    impact_description = (
         'Impact terms: H=query state/content | E=query positional embedding | '
-        'X=image appearance feature | G3D=image 3D positional encoding | '
-        'GMV=multiview positional encoding',
+        'X=image appearance | GMV=multiview PE')
+    if 'G3D' in ' '.join(impact_names):
+        impact_description += ' | G3D=image 3DPE'
+    if 'URoPE' in impact_names:
+        impact_description += ' | URoPE=relative rotary 3D geometry'
+    cv2.putText(
+        header, impact_description,
         (18, 104), cv2.FONT_HERSHEY_SIMPLEX, 0.52, (185, 200, 220), 1,
         cv2.LINE_AA)
     cv2.putText(
         header,
         'Impact % = relative change in attention over all valid image tokens '
-        'when that term is removed (six terms sum to 100% per layer)',
+        'when that term is removed (shown terms sum to 100% per layer)',
         (18, 130), cv2.FONT_HERSHEY_SIMPLEX, 0.52, (185, 200, 220), 1,
         cv2.LINE_AA)
     cv2.imwrite(str(target_dir / 'attention_all_layers.png'),
@@ -964,6 +1103,8 @@ def main():
         raise RuntimeError('CUDA was requested but is unavailable')
     if args.bev_ray_top_k < 1:
         raise ValueError('--bev-ray-top-k must be positive')
+    if args.max_gt_match_distance <= 0:
+        raise ValueError('--max-gt-match-distance must be positive')
     invalid_layers = [layer for layer in args.bev_ray_layers
                       if layer < 1 or layer > 6]
     if invalid_layers:
@@ -972,6 +1113,16 @@ def main():
     cfg = Config.fromfile(args.config)
     import_plugin(cfg)
     cfg.model.pretrained = None
+    if args.data_root is not None:
+        cfg.data.test.data_root = args.data_root
+        if 'data_root' in cfg:
+            cfg.data_root = args.data_root
+    if args.ann_file is not None:
+        cfg.data.test.ann_file = args.ann_file
+        if 'test_ann_file' in cfg:
+            cfg.test_ann_file = args.ann_file
+    if args.dataset_name is not None and 'dataset_name' in cfg:
+        cfg.dataset_name = args.dataset_name
     cfg.data.test.test_mode = True
     dataset = build_dataset(cfg.data.test)
     relocate_dataset_paths(dataset, cfg.data.test.data_root)
@@ -997,6 +1148,15 @@ def main():
     img, img_metas = first_augmentation(data)
     img_metas[0]['camera_names'] = list(dataset.data_infos[index]['cams'])
     head = model.pts_bbox_head
+    model_metadata = {
+        'config': str(args.config),
+        'checkpoint': str(args.checkpoint),
+        'position_embedding_mode': head.position_embedding_mode,
+        'with_position': bool(head.with_position),
+        'with_multiview': bool(head.with_multiview),
+        'urope_with_multiview_pe': bool(getattr(
+            head, 'urope_with_multiview_pe', False)),
+    }
 
     with torch.no_grad():
         features = model.extract_feat(img=img, img_metas=img_metas)
@@ -1006,14 +1166,14 @@ def main():
         candidates = query_candidates(
             head, baseline, gt_boxes, gt_labels, class_names,
             args.score_threshold, allowed_label_ids)
-        output_dir = Path(args.output_dir) / token
+        output_dir = Path(args.output_dir) / (args.run_label or token)
         precheck_path = write_query_precheck(
             output_dir, candidates, token, index, args.score_threshold,
-            args.classes or class_names)
+            args.classes or class_names, model_metadata)
         if args.list_queries:
             print('Query precheck written to:', precheck_path)
             return
-        targets = choose_queries(candidates, args)
+        targets = choose_queries(candidates, args, gt_boxes, class_names)
         query_indices = [target['query_index']
                          for target in targets.values()]
         traces = []
@@ -1068,6 +1228,7 @@ def main():
         'scene_name': args.scene_name,
         'scene_frame_index': args.scene_frame_index,
         'query_indices': query_indices,
+        'model': model_metadata,
         'reference_points_normalized': tensor_cpu(
             selected_references),
         'reference_points_metric': tensor_cpu(metric_references),
@@ -1094,6 +1255,12 @@ def main():
     metadata = {
         'sample_token': token,
         'dataset_index': index,
+        'scene_name': args.scene_name,
+        'scene_frame_index': args.scene_frame_index,
+        'dataset_name': args.dataset_name,
+        'data_root': args.data_root or cfg.data.test.data_root,
+        'ann_file': args.ann_file or cfg.data.test.ann_file,
+        'model': model_metadata,
         'score_threshold': args.score_threshold,
         'selected_classes': args.classes or class_names,
         'targets': serializable_targets(
@@ -1113,7 +1280,9 @@ def main():
             'Per component: mean Jensen-Shannon divergence across attention '
             'heads between full attention and leave-one-component-out '
             'attention over all valid image tokens; normalized to 100% across '
-            'the six components for each query and decoder layer.'),
+            'the displayed components for each query and decoder layer. For '
+            'URoPE, the URoPE term compares full rotary attention against '
+            'attention from the same projected Q/K without rotary geometry.'),
         'second_forward_max_abs_error': output_difference,
     }
     with open(str(output_dir / 'trace_summary.json'), 'w') as handle:

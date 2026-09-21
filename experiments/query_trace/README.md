@@ -138,3 +138,87 @@ The tracer runs PETR twice on cached image features: once to choose or verify
 the final matches and once with diagnostic attention capture. It checks that
 both model outputs agree and validates the diagnostic attention against the
 original cross-attention output.
+
+## nuScenes URoPE trace
+
+The same generic `trace_query.py` entry point supports PETR-URoPE. Pass the
+URoPE config and checkpoint just as for baseline PETR. For sample token
+`22ce804db92749a1aee3a08ffbecfbbd`, baseline PETR query 163 is matched to GT
+index 57 (car). To trace the URoPE query assigned to that same physical object:
+
+```bash
+python experiments/query_trace/trace_query.py \
+  --config projects/configs/petr/petr_r50dcn_gridmask_p4_nuscenes_fresh_2gpu_global_batch8_urope_multiview.py \
+  --checkpoint results/petr_r50dcn_gridmask_p4_nuscenes_fresh_2gpu_global_batch8_urope_multiview/epoch_24.pth \
+  --sample-token 22ce804db92749a1aee3a08ffbecfbbd \
+  --gt-indices 57 \
+  --dataset-name nuScenes-URoPE \
+  --output-dir experiments/query_trace/outputs/nuscenes_urope \
+  --plot-bev-rays \
+  --bev-ray-layers 1 2 3 4 5 6
+```
+
+Use `--query-indices 163` instead only if the intention is specifically to
+inspect URoPE's own query 163. Query IDs are model-specific, so that is not
+guaranteed to be the object represented by baseline PETR query 163.
+
+URoPE outputs record the config, checkpoint and positional-encoding settings.
+They save full per-head attention plus relative rotary-geometry impact;
+`G3D` is absent because learned PETR frustum 3DPE is disabled, while `GMV`
+remains because this model retains multiview PE.
+
+## PCCR R1 to R1-f paired trace
+
+First list the matched objects and queries for an R1 validation frame:
+
+```bash
+SCENE_NAME=val_10 SCENE_FRAME_INDEX=3 \
+  bash experiments/query_trace/run_pccr_r1_r1f.sh
+```
+
+Inspect
+`val_10_frame_003/_precheck/R1_val/query_candidates.csv`, choose one or more
+query IDs, and run the paired trace:
+
+```bash
+SCENE_NAME=val_10 SCENE_FRAME_INDEX=3 QUERY_INDICES="735" \
+  bash experiments/query_trace/run_pccr_r1_r1f.sh
+```
+
+The R1-f run does **not** reuse the R1 query indices. Instead, it reads
+`R1_val/trace_summary.json`, matches each target by class and 3D GT center,
+and traces the decoder query assigned to that same physical object. Matching
+fails if the nearest center is more than 0.25 m away, preventing an accidental
+comparison of different frames or objects.
+
+Results are grouped first by the selected R1 query, making each cross-rig
+comparison self-contained:
+
+```text
+pccr_r1_vs_r1f/
+└── val_10_frame_003/
+    └── query_0735/
+    │   ├── R1_val/
+    │   └── R1-f_val/
+```
+
+Each rig directory contains the full camera attention grid, layerwise tensor
+trace, and BEV ray-attention plots for decoder layers 1 through 6. Override
+`CHECKPOINT`, `DEVICE`, `OUTPUT_DIR`, or `PYTHON_BIN` through environment
+variables when needed.
+
+The equivalent direct command for listing R1 candidates is:
+
+```bash
+python experiments/query_trace/trace_query.py \
+  --config projects/configs/petr/petr_r50dcn_gridmask_p4_800x320_pccr.py \
+  --checkpoint results/petr_r50dcn_gridmask_p4_800x320_pccr/R1/latest.pth \
+  --data-root data/pccr/R1/ \
+  --ann-file data/pccr/R1/R1_infos_val.pkl \
+  --dataset-name R1 --sample-index 0 --list-queries
+```
+
+The CSV reports the query ID, matched GT ID and class, classification result,
+confidence, and BEV localization error. This supports choosing a correctly
+localized object, a failed object, or both before performing the expensive
+layerwise trace.
