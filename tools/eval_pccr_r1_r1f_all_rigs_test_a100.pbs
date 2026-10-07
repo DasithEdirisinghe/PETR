@@ -1,0 +1,11 @@
+#!/bin/bash -l
+#PBS -N petr_r1_r1f_test
+#PBS -l select=1:ncpus=12:ngpus=1:mem=48GB:gpu_id=A100
+#PBS -l walltime=06:00:00
+#PBS -m abe
+#PBS -j oe
+
+set -euo pipefail
+
+PETR_DIR="${PETR_DIR:-/mnt/hpccs01/home/n12893251/dasith_ws/dev_ws/PETR}"
+exec bash -l "$PETR_DIR/tools/eval_pccr_r1_r1f_all_rigs_test.sh"

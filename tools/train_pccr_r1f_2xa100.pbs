@@ -1,0 +1,117 @@
+#!/bin/bash -l
+#PBS -N petr_pccr_r1f_A100
+#PBS -l select=1:ncpus=24:ngpus=2:mem=80GB:gpu_id=A100
+#PBS -l walltime=48:00:00
+#PBS -m abe
+#PBS -j oe
+
+set -eo pipefail
+
+conda activate petr
+
+PETR_DIR="${PETR_DIR:-/mnt/hpccs01/home/n12893251/dasith_ws/dev_ws/PETR}"
+cd "$PETR_DIR"
+export PYTHONPATH="$PETR_DIR:${PYTHONPATH:-}"
+
+CONFIG="${CONFIG:-projects/configs/petr/petr_r50dcn_gridmask_p4_800x320_pccr_r1f.py}"
+OUTPUT_DIR="${OUTPUT_DIR:-results/petr_r50dcn_gridmask_p4_800x320_pccr/R1-f}"
+NUM_GPUS="${NUM_GPUS:-2}"
+
+echo "PBS job: ${PBS_JOBID:-unknown}"
+echo "Host: $(hostname)"
+echo "Working directory: $(pwd)"
+echo "Config: $CONFIG"
+echo "Output directory: $OUTPUT_DIR"
+nvidia-smi
+
+required_files=(
+    "$CONFIG"
+    "data/pccr/R1-f/R1-f_infos_train.pkl"
+    "data/pccr/R1-f/R1-f_infos_val.pkl"
+    "data/pccr/R1-f/R1-f_infos_test.pkl"
+)
+for required_file in "${required_files[@]}"; do
+    if [[ ! -f "$required_file" ]]; then
+        echo "Required file is missing: $required_file" >&2
+        exit 1
+    fi
+done
+
+echo "Resolved configuration:"
+python tools/misc/print_config.py "$CONFIG"
+
+echo "Starting vanilla PETR training on R1-f."
+bash tools/dist_train.sh "$CONFIG" "$NUM_GPUS" \
+    --work-dir "$OUTPUT_DIR" \
+    --seed 0
+
+CHECKPOINT="$OUTPUT_DIR/latest.pth"
+if [[ ! -f "$CHECKPOINT" ]]; then
+    echo "Training completed without the expected checkpoint: $CHECKPOINT" >&2
+    exit 1
+fi
+
+echo "Training complete: $CHECKPOINT"
+
+echo "Evaluating the R1-f-trained checkpoint on all PCCR rigs."
+export MODEL_NAME="${MODEL_NAME:-PETR}"
+export TRAIN_RIG="${TRAIN_RIG:-R1-f}"
+export CONFIG
+export CHECKPOINT
+export DATA_ROOT="${DATA_ROOT:-data/pccr}"
+export OUTPUT_ROOT="${OUTPUT_ROOT:-$OUTPUT_DIR/cross_rig}"
+export SAMPLES_PER_GPU="${SAMPLES_PER_GPU:-4}"
+export WORKERS_PER_GPU="${WORKERS_PER_GPU:-4}"
+export BASE_PORT="${BASE_PORT:-29600}"
+export SKIP_COMPLETED="${SKIP_COMPLETED:-1}"
+
+bash tools/eval_pccr_r1_all_rigs.sh
+
+R1F_RESULT="$OUTPUT_ROOT/standardized/$MODEL_NAME/trained_on_$TRAIN_RIG.json"
+PLOT_DIR="$OUTPUT_ROOT/comparison"
+PROFILE_STEM="$PLOT_DIR/petr_trained_r1f_cross_rig_profile"
+mkdir -p "$PLOT_DIR"
+
+if [[ ! -f "$R1F_RESULT" ]]; then
+    echo "Missing standardized R1-f result: $R1F_RESULT" >&2
+    exit 1
+fi
+
+echo "Generating the R1-f-trained cross-rig profile."
+python tools/analysis_tools/plot_cross_rig_profile.py \
+    "$R1F_RESULT" \
+    "$PROFILE_STEM.svg" \
+    --label "Vanilla PETR trained on R1-f" \
+    --title "Vanilla PETR cross-rig performance after training on R1-f"
+
+R1_RESULT="$PETR_DIR/results/petr_r50dcn_gridmask_p4_800x320_pccr/R1/cross_rig/standardized/PETR/trained_on_R1.json"
+COMPARISON_STEM="$PLOT_DIR/petr_r1_vs_r1f_training_comparison"
+if [[ -f "$R1_RESULT" ]]; then
+    echo "Generating the R1-trained versus R1-f-trained comparison."
+    python tools/analysis_tools/plot_cross_rig_comparison.py \
+        "$R1_RESULT" \
+        "$R1F_RESULT" \
+        "$COMPARISON_STEM.svg" \
+        --reference-label "Vanilla PETR trained on R1" \
+        --new-label "Vanilla PETR trained on R1-f" \
+        --reference-components "petr3dpe,multiview,query3d" \
+        --new-components "petr3dpe,multiview,query3d" \
+        --train-rig "$TRAIN_RIG"
+else
+    echo "R1 baseline result is unavailable; skipping the comparison plot: $R1_RESULT"
+fi
+
+if command -v rsvg-convert >/dev/null 2>&1; then
+    rsvg-convert -w 1600 -h 780 "$PROFILE_STEM.svg" \
+        -o "$PROFILE_STEM.png"
+    if [[ -f "$COMPARISON_STEM.svg" ]]; then
+        rsvg-convert -w 1600 -h 1180 "$COMPARISON_STEM.svg" \
+            -o "$COMPARISON_STEM.png"
+    fi
+else
+    echo "rsvg-convert is unavailable; SVG plots were still generated."
+fi
+
+echo "R1-f vanilla PETR training, all-rig evaluation, and plotting complete."
+echo "Standardized result: $R1F_RESULT"
+echo "Cross-rig profile: $PROFILE_STEM.svg"

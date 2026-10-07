@@ -49,6 +49,12 @@ class Petr3D(MVXTwoStageDetector):
                              train_cfg, test_cfg, pretrained)
         self.grid_mask = GridMask(True, True, rotate=1, offset=False, ratio=0.5, mode=1, prob=0.7)
         self.use_grid_mask = use_grid_mask
+        if getattr(self.pts_bbox_head, 'oracle_adapter', None) is not None:
+            # The oracle experiment must measure the capacity of the small
+            # adapter, rather than silently fine-tuning the source detector.
+            for name, parameter in self.named_parameters():
+                parameter.requires_grad = (
+                    name.startswith('pts_bbox_head.oracle_adapter.'))
 
     def extract_img_feat(self, img, img_metas):
         """Extract features of images."""

@@ -81,6 +81,11 @@ def parse_args():
     parser.add_argument('--match-targets-from', default=None,
                         help='Trace the same physical GT objects as a previous '
                              'trace_summary.json, matched by class and 3D center.')
+    parser.add_argument('--fixed-query-targets-from', default=None,
+                        help='Match the physical GT objects from a previous '
+                             'trace_summary.json, but retain each source query '
+                             'index even when the target-rig Hungarian match '
+                             'uses another query.')
     parser.add_argument('--max-gt-match-distance', type=float, default=0.25,
                         help='Maximum 3D center distance in metres when matching '
                              '--match-targets-from (default: 0.25).')
@@ -243,12 +248,14 @@ def query_candidates(head, outputs, gt_boxes, gt_labels, class_names,
     return candidates
 
 
-def choose_queries(candidates, args, gt_boxes, class_names):
+def choose_queries(candidates, args, gt_boxes, gt_labels, class_names,
+                   outputs):
     selection_modes = sum(bool(value) for value in (
-        args.query_indices, args.gt_indices, args.match_targets_from))
+        args.query_indices, args.gt_indices, args.match_targets_from,
+        args.fixed_query_targets_from))
     if selection_modes > 1:
         raise ValueError('Use only one of --query-indices, --gt-indices, or '
-                         '--match-targets-from')
+                         '--match-targets-from/--fixed-query-targets-from')
     if args.query_indices:
         by_query = {row['query_index']: row for row in candidates}
         missing = [query for query in args.query_indices if query not in by_query]
@@ -265,14 +272,19 @@ def choose_queries(candidates, args, gt_boxes, class_names):
                 'No final-layer Hungarian-matched query for GT indices: {}'.format(
                     missing))
         selected = [dict(by_gt[gt]) for gt in args.gt_indices]
-    elif args.match_targets_from:
-        with open(args.match_targets_from, 'r') as handle:
+    elif args.match_targets_from or args.fixed_query_targets_from:
+        source_path = (args.match_targets_from or
+                       args.fixed_query_targets_from)
+        with open(source_path, 'r') as handle:
             source = json.load(handle)
         source_targets = source.get('targets', {})
         if not source_targets:
             raise ValueError('Source trace contains no targets: {}'.format(
-                args.match_targets_from))
+                source_path))
         by_gt = {row['gt_index']: row for row in candidates}
+        cls = outputs['all_cls_scores'][-1, 0]
+        boxes = outputs['all_bbox_preds'][-1, 0]
+        probabilities = cls.sigmoid()
         selected = []
         used_gt = set()
         for source_name, source_target in source_targets.items():
@@ -286,8 +298,15 @@ def choose_queries(candidates, args, gt_boxes, class_names):
             distances = torch.norm(gt_boxes[:, :3] - source_center[None], dim=1)
             valid = [index for index in range(len(gt_boxes))
                      if int(index) not in used_gt and
-                     int(index) in by_gt and
-                     by_gt[int(index)]['gt_label'] == class_id]
+                     int(gt_labels[index]) == class_id]
+            # GT labels are encoded in the Hungarian candidate table. In the
+            # normal object-matched mode, require an assigned query. Fixed
+            # query mode only needs the physical GT and deliberately retains
+            # the source query even if target-rig assignment changes.
+            if args.match_targets_from:
+                valid = [index for index in valid
+                         if int(index) in by_gt and
+                         by_gt[int(index)]['gt_label'] == class_id]
             if not valid:
                 raise ValueError('No matched {} GT is available for source target '
                                  '{}'.format(class_name, source_name))
@@ -299,7 +318,29 @@ def choose_queries(candidates, args, gt_boxes, class_names):
                     'This likely is not the same synchronized frame/object.'.format(
                         class_name, source_name, distance,
                         args.max_gt_match_distance))
-            row = dict(by_gt[gt_index])
+            if args.match_targets_from:
+                row = dict(by_gt[gt_index])
+            else:
+                query_index = int(source_target['query_index'])
+                if not 0 <= query_index < cls.shape[0]:
+                    raise ValueError('Source query index is outside the model: '
+                                     '{}'.format(query_index))
+                predicted_label = int(probabilities[query_index].argmax())
+                row = dict(
+                    query_index=query_index,
+                    gt_index=int(gt_index),
+                    gt_label=class_id,
+                    gt_class=class_name,
+                    predicted_label=predicted_label,
+                    predicted_class=class_names[predicted_label],
+                    class_correct=int(predicted_label == class_id),
+                    confidence=float(probabilities[query_index, class_id]),
+                    above_score_threshold=int(float(
+                        probabilities[query_index, class_id]) >=
+                        args.score_threshold),
+                    bev_error_m=float(torch.norm(
+                        boxes[query_index, :2] - gt_boxes[gt_index, :2])),
+                    fixed_query_from_source=True)
             row['source_target_name'] = source_name
             row['cross_rig_gt_center_distance_m'] = distance
             selected.append(row)
@@ -540,9 +581,15 @@ def install_attention_trace(head, query_indices, records, image_3d_pe,
                     logits_all.float(), dim=-1).to(q.dtype)
                 attention = attention_all[0, :, query_indices]
 
-            q_content = F.linear(query, weight[:dims], None)
+            # Fold projection biases into H and X. The six named terms then
+            # sum to the complete projected-Q/projected-K dot product (before
+            # masks and softmax), rather than silently omitting bias effects.
+            q_content = F.linear(
+                query, weight[:dims], None if bias is None else bias[:dims])
             q_position = F.linear(query_pos, weight[:dims], None)
-            k_content = F.linear(key, weight[dims:2*dims], None)
+            k_content = F.linear(
+                key, weight[dims:2*dims],
+                None if bias is None else bias[dims:2*dims])
             k_3d = F.linear(image_3d_pe, weight[dims:2*dims], None)
             k_multiview = F.linear(
                 image_multiview_pe, weight[dims:2*dims], None)
@@ -1344,7 +1391,8 @@ def main():
         if args.list_queries:
             print('Query precheck written to:', precheck_path)
             return
-        targets = choose_queries(candidates, args, gt_boxes, class_names)
+        targets = choose_queries(
+            candidates, args, gt_boxes, gt_labels, class_names, baseline)
         query_indices = [target['query_index']
                          for target in targets.values()]
         traces = []
@@ -1406,6 +1454,10 @@ def main():
         'traces': traces,
         'all_cls_scores': tensor_cpu(baseline['all_cls_scores']),
         'all_bbox_preds': tensor_cpu(baseline['all_bbox_preds']),
+        'lidar2img': tensor_cpu(torch.as_tensor(
+            np.asarray(img_metas[0]['lidar2img']))),
+        'pad_shape': [list(shape) for shape in img_metas[0]['pad_shape']],
+        'camera_names': list(img_metas[0]['camera_names']),
         'key_layout': dict(num_cameras=num_cams, height=feat_h, width=feat_w,
                            order='camera,y,x'),
     }, str(output_dir / 'trace_tensors.pt'))
@@ -1468,6 +1520,10 @@ def main():
             'the displayed components for each query and decoder layer. For '
             'URoPE, the URoPE term compares full rotary attention against '
             'attention from the same projected Q/K without rotary geometry.'),
+        'component_bias_convention': (
+            'Q projection bias is folded into H and K projection bias is '
+            'folded into X, making the named projected components additive '
+            'to the actual biased Q/K projections.'),
         'second_forward_max_abs_error': output_difference,
     }
     with open(str(output_dir / 'trace_summary.json'), 'w') as handle:

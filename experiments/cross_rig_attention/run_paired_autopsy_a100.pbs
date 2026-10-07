@@ -1,0 +1,45 @@
+#!/bin/bash -l
+#PBS -N petr_r1_r1f_autopsy
+#PBS -l select=1:ncpus=12:ngpus=1:mem=64GB:gpu_id=A100
+#PBS -l walltime=08:00:00
+#PBS -m abe
+#PBS -j oe
+
+set -euo pipefail
+
+conda activate petr
+
+PETR_DIR="${PETR_DIR:-/mnt/hpccs01/home/n12893251/dasith_ws/dev_ws/PETR}"
+cd "$PETR_DIR"
+export PYTHONPATH="$PETR_DIR:${PYTHONPATH:-}"
+
+: "${SCENE_NAME:?Set SCENE_NAME, for example val_03}"
+: "${FRAME_INDEX:?Set zero-based FRAME_INDEX}"
+
+args=(
+    --scene-name "$SCENE_NAME"
+    --scene-frame-index "$FRAME_INDEX"
+    --device "${DEVICE:-cuda:0}"
+)
+
+if [[ -n "${GT_INDICES:-}" && -n "${QUERY_INDICES:-}" ]]; then
+    echo "Set only GT_INDICES or QUERY_INDICES, not both." >&2
+    exit 1
+elif [[ -n "${GT_INDICES:-}" ]]; then
+    read -r -a selected <<< "$GT_INDICES"
+    args+=(--gt-indices "${selected[@]}")
+elif [[ -n "${QUERY_INDICES:-}" ]]; then
+    read -r -a selected <<< "$QUERY_INDICES"
+    args+=(--query-indices "${selected[@]}")
+else
+    echo "Set GT_INDICES or QUERY_INDICES after running the precheck." >&2
+    exit 1
+fi
+
+if [[ "${SKIP_EXISTING:-0}" == "1" ]]; then
+    args+=(--skip-existing)
+fi
+
+echo "Running paired R1/R1-f attention autopsy on $(hostname)."
+nvidia-smi
+python experiments/cross_rig_attention/run_paired_trace.py "${args[@]}"

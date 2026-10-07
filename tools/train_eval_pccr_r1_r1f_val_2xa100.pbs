@@ -1,0 +1,148 @@
+#!/bin/bash -l
+#PBS -N petr_r1_r1f_val
+#PBS -l select=1:ncpus=24:ngpus=2:mem=80GB:gpu_id=A100
+#PBS -l walltime=48:00:00
+#PBS -m abe
+#PBS -j oe
+
+set -euo pipefail
+
+conda activate petr
+
+PETR_DIR="${PETR_DIR:-/mnt/hpccs01/home/n12893251/dasith_ws/dev_ws/PETR}"
+cd "$PETR_DIR"
+export PYTHONPATH="$PETR_DIR:${PYTHONPATH:-}"
+
+CONFIG="${CONFIG:-projects/configs/petr/petr_r50dcn_gridmask_p4_800x320_pccr_r1_r1f.py}"
+OUTPUT_DIR="${OUTPUT_DIR:-results/petr_r50dcn_gridmask_p4_800x320_pccr/R1_R1f}"
+DATA_ROOT="${DATA_ROOT:-data/pccr}"
+NUM_GPUS="${NUM_GPUS:-2}"
+BASE_PORT="${BASE_PORT:-29600}"
+SKIP_TRAIN="${SKIP_TRAIN:-0}"
+SKIP_COMPLETED="${SKIP_COMPLETED:-0}"
+SAMPLES_PER_GPU="${SAMPLES_PER_GPU:-4}"
+WORKERS_PER_GPU="${WORKERS_PER_GPU:-4}"
+
+RIGS=(R1 R1-c10 R1-c6 R1-f R1-r R1-t R2 R3 R4 R5 R6 R7 R8 R9)
+
+echo "PBS job: ${PBS_JOBID:-unknown}"
+echo "Host: $(hostname)"
+echo "Config: $CONFIG"
+echo "Output directory: $OUTPUT_DIR"
+nvidia-smi
+
+for required_file in \
+    "$CONFIG" \
+    "$DATA_ROOT/R1/R1_infos_train.pkl" \
+    "$DATA_ROOT/R1-f/R1-f_infos_train.pkl"; do
+    if [[ ! -f "$required_file" ]]; then
+        echo "Required file is missing: $required_file" >&2
+        exit 1
+    fi
+done
+for rig in "${RIGS[@]}"; do
+    ann_file="$DATA_ROOT/$rig/${rig}_infos_val.pkl"
+    if [[ ! -f "$ann_file" ]]; then
+        echo "Validation annotations are missing: $ann_file" >&2
+        exit 1
+    fi
+done
+
+echo "Resolved configuration:"
+python tools/misc/print_config.py "$CONFIG"
+
+if [[ "$SKIP_TRAIN" == "0" ]]; then
+    echo "Training vanilla PETR on concatenated R1 and R1-f train splits."
+    bash tools/dist_train.sh "$CONFIG" "$NUM_GPUS" \
+        --work-dir "$OUTPUT_DIR" --seed 0
+elif [[ "$SKIP_TRAIN" != "1" ]]; then
+    echo "SKIP_TRAIN must be 0 or 1" >&2
+    exit 1
+fi
+
+CHECKPOINT="$OUTPUT_DIR/latest.pth"
+if [[ ! -f "$CHECKPOINT" ]]; then
+    echo "Checkpoint is missing: $CHECKPOINT" >&2
+    exit 1
+fi
+
+VAL_ROOT="$OUTPUT_DIR/cross_rig_val"
+for index in "${!RIGS[@]}"; do
+    rig="${RIGS[$index]}"
+    ann_file="$DATA_ROOT/$rig/${rig}_infos_val.pkl"
+    eval_dir="$VAL_ROOT/evaluations/$rig"
+    formatted_dir="$eval_dir/formatted"
+    metrics_file="$formatted_dir/metrics_summary.json"
+    predictions_file="$eval_dir/predictions.pkl"
+    log_file="$eval_dir/inference.log"
+    mkdir -p "$eval_dir"
+
+    if [[ "$SKIP_COMPLETED" == "1" && -s "$metrics_file" && -s "$predictions_file" ]]; then
+        echo "Reusing completed validation inference for $rig"
+        continue
+    fi
+
+    echo "Evaluating $CHECKPOINT on $rig validation split"
+    PORT="$((BASE_PORT + index))" bash tools/dist_test.sh \
+        "$CONFIG" "$CHECKPOINT" 1 \
+        --cfg-options \
+            "dataset_name=$rig" \
+            "data_root=$DATA_ROOT/$rig/" \
+            "val_ann_file=$ann_file" \
+            "test_ann_file=$ann_file" \
+            "data.test.data_root=$DATA_ROOT/$rig/" \
+            "data.test.ann_file=$ann_file" \
+            "data.samples_per_gpu=$SAMPLES_PER_GPU" \
+            "data.workers_per_gpu=$WORKERS_PER_GPU" \
+        --out "$predictions_file" \
+        --eval bbox \
+        --eval-options "jsonfile_prefix=$formatted_dir" \
+        2>&1 | tee "$log_file"
+
+    if [[ ! -s "$metrics_file" || ! -s "$predictions_file" ]]; then
+        echo "Validation inference did not produce predictions and metrics for $rig" >&2
+        exit 1
+    fi
+done
+
+RESULT="$VAL_ROOT/standardized/PETR/trained_on_R1_R1f.json"
+python tools/analysis_tools/collect_pccr_val_results.py \
+    --evaluations "$VAL_ROOT/evaluations" \
+    --output "$RESULT" \
+    --model PETR --trained-on R1_R1f
+
+PLOT_DIR="$VAL_ROOT/comparison"
+PROFILE="$PLOT_DIR/petr_r1_r1f_val_profile"
+python tools/analysis_tools/plot_cross_rig_profile.py \
+    "$RESULT" "$PROFILE.svg" \
+    --label "Vanilla PETR trained on R1 + R1-f" \
+    --title "PETR validation performance after training on R1 + R1-f" \
+    --train-rigs R1 R1-f --split val
+
+# Optional comparison input must be a validation result in the same schema.
+REFERENCE_VAL_RESULT="${REFERENCE_VAL_RESULT:-}"
+COMPARISON="$PLOT_DIR/petr_reference_vs_r1_r1f_val"
+if [[ -n "$REFERENCE_VAL_RESULT" ]]; then
+    if [[ ! -f "$REFERENCE_VAL_RESULT" ]]; then
+        echo "Reference validation result is missing: $REFERENCE_VAL_RESULT" >&2
+        exit 1
+    fi
+    python tools/analysis_tools/plot_cross_rig_comparison.py \
+        "$REFERENCE_VAL_RESULT" "$RESULT" "$COMPARISON.svg" \
+        --reference-label "Reference PETR" \
+        --new-label "PETR trained on R1 + R1-f" \
+        --reference-components "petr3dpe,multiview,query3d" \
+        --new-components "petr3dpe,multiview,query3d" \
+        --train-rig "R1 + R1-f"
+fi
+
+if command -v rsvg-convert >/dev/null 2>&1; then
+    rsvg-convert -w 1600 -h 780 "$PROFILE.svg" -o "$PROFILE.png"
+    if [[ -f "$COMPARISON.svg" ]]; then
+        rsvg-convert -w 1600 -h 1180 "$COMPARISON.svg" -o "$COMPARISON.png"
+    fi
+fi
+
+echo "All-rig validation complete."
+echo "Results: $RESULT"
+echo "Profile: $PROFILE.svg"

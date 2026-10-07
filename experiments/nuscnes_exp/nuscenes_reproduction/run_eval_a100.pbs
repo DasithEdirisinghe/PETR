@@ -1,0 +1,18 @@
+#!/bin/bash -l
+#PBS -N petr_nuscenes_eval
+#PBS -l select=1:ncpus=12:ngpus=1:mem=64GB:gpu_id=A100
+#PBS -l walltime=08:00:00
+#PBS -m abe
+#PBS -j oe
+
+set -euo pipefail
+conda activate petr
+
+PETR_DIR=/mnt/hpccs01/home/n12893251/dasith_ws/dev_ws/PETR
+cd "$PETR_DIR"
+export PYTHONPATH="$PETR_DIR:${PYTHONPATH:-}"
+
+bash experiments/nuscenes_reproduction/run_eval.sh \
+  projects/configs/petr/petr_r50dcn_gridmask_p4_nuscenes_local.py \
+  ckpts/petr_r50dcn_gridmask_p4_epoch_24.pth \
+  experiments/nuscenes_reproduction/outputs

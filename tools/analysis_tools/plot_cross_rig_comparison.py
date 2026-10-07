@@ -68,7 +68,8 @@ def load_map(path):
     missing = [rig for rig in RIG_ORDER if rig not in results]
     if missing:
         raise ValueError("Missing rigs in {}: {}".format(path, ", ".join(missing)))
-    return [100.0 * results[rig]["metrics"]["mAP"] for rig in RIG_ORDER]
+    return ([100.0 * results[rig]["metrics"]["mAP"] for rig in RIG_ORDER],
+            payload.get("split", "test"))
 
 
 def esc(value):
@@ -110,8 +111,10 @@ def nice_tick_step(span, target_intervals=6):
 
 def main():
     args = parse_args()
-    reference = load_map(args.reference)
-    new = load_map(args.new)
+    reference, reference_split = load_map(args.reference)
+    new, new_split = load_map(args.new)
+    if new_split != reference_split:
+        raise ValueError("Cannot compare {} with {} results".format(reference_split, new_split))
     series = [reference, new]
     labels = [args.reference_label, args.new_label]
     component_sets = [
@@ -119,19 +122,28 @@ def main():
         parse_components(args.new_components),
     ]
     if args.third:
-        series.append(load_map(args.third))
+        third, third_split = load_map(args.third)
+        if third_split != reference_split:
+            raise ValueError("Cannot compare {} with {} results".format(reference_split, third_split))
+        series.append(third)
         labels.append(args.third_label)
         component_sets.append(parse_components(args.third_components))
     if args.fourth:
         if not args.third:
             raise ValueError("--fourth requires --third")
-        series.append(load_map(args.fourth))
+        fourth, fourth_split = load_map(args.fourth)
+        if fourth_split != reference_split:
+            raise ValueError("Cannot compare {} with {} results".format(reference_split, fourth_split))
+        series.append(fourth)
         labels.append(args.fourth_label)
         component_sets.append(parse_components(args.fourth_components))
     if args.fifth:
         if not args.fourth:
             raise ValueError("--fifth requires --fourth")
-        series.append(load_map(args.fifth))
+        fifth, fifth_split = load_map(args.fifth)
+        if fifth_split != reference_split:
+            raise ValueError("Cannot compare {} with {} results".format(reference_split, fifth_split))
+        series.append(fifth)
         labels.append(args.fifth_label)
         component_sets.append(parse_components(args.fifth_components))
 

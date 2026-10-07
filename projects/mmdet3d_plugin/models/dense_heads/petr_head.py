@@ -29,6 +29,8 @@ from mmcv.cnn import xavier_init, constant_init, kaiming_init
 import math
 from mmdet.models.utils import NormedLinear
 from projects.mmdet3d_plugin.models.utils.urope import build_urope_3d_positions
+from projects.mmdet3d_plugin.models.utils.oracle_rig_adapter import \
+    OracleRigAdapter
 def pos2posemb3d(pos, num_pos_feats=128, temperature=10000):
     scale = 2 * math.pi
     pos = pos * scale
@@ -116,6 +118,7 @@ class PETRHead(AnchorFreeHead):
                  urope_cfg=None,
                  urope_with_multiview_pe=False,
                  lidar_oracle_cfg=None,
+                 oracle_adapter=None,
                  **kwargs):
         # NOTE here use `AnchorFreeHead` instead of `TransformerHead`,
         # since it brings inconvenience when the initialization of
@@ -196,6 +199,7 @@ class PETRHead(AnchorFreeHead):
         self.urope_cfg = dict(urope_cfg or {})
         self.urope_with_multiview_pe = urope_with_multiview_pe
         self.lidar_oracle_cfg = dict(lidar_oracle_cfg or {})
+        self.oracle_adapter_cfg = dict(oracle_adapter or {})
         self.lidar_oracle_with_multiview_pe = self.lidar_oracle_cfg.get(
             'with_multiview_pe', True)
         if position_embedding_mode == 'hybrid' and not with_position:
@@ -298,6 +302,7 @@ class PETRHead(AnchorFreeHead):
         self.bbox_coder = build_bbox_coder(bbox_coder)
         self.pc_range = self.bbox_coder.pc_range
         self._init_layers()
+        self._configure_oracle_training()
 
     def _init_layers(self):
         """Initialize layers of the transformer head."""
@@ -367,6 +372,25 @@ class PETRHead(AnchorFreeHead):
             nn.ReLU(),
             nn.Linear(self.embed_dims, self.embed_dims),
         )
+        if self.oracle_adapter_cfg:
+            self.oracle_adapter = OracleRigAdapter(
+                embed_dims=self.embed_dims, **self.oracle_adapter_cfg)
+        else:
+            self.oracle_adapter = None
+
+    def _configure_oracle_training(self):
+        """Freeze the source detector and expose only oracle parameters."""
+        if self.oracle_adapter is None:
+            return
+        for name, parameter in self.named_parameters():
+            parameter.requires_grad = name.startswith('oracle_adapter.')
+
+    def oracle_trainable_parameter_summary(self):
+        trainable = sum(
+            parameter.numel() for parameter in self.parameters()
+            if parameter.requires_grad)
+        total = sum(parameter.numel() for parameter in self.parameters())
+        return dict(trainable=trainable, total=total)
 
     def init_weights(self):
         """Initialize weights of the transformer head."""
@@ -543,6 +567,16 @@ class PETRHead(AnchorFreeHead):
                     pos_embeds.append(pos_embed.unsqueeze(1))
                 pos_embed = torch.cat(pos_embeds, 1)
 
+        camera_embedding = None
+        rig_embedding = None
+        if self.oracle_adapter is not None:
+            camera_embedding, rig_embedding = \
+                self.oracle_adapter.encode_calibration(
+                    img_metas, x.device, x.dtype)
+            if self.oracle_adapter.adapts_key:
+                pos_embed = self.oracle_adapter.adapt_key(
+                    pos_embed, camera_embedding)
+
         if reference_points_override is None:
             # Preserve the original PETR path exactly when no oracle override
             # is requested.
@@ -577,6 +611,17 @@ class PETRHead(AnchorFreeHead):
             raise ValueError(
                 'reference_points_override must have shape [Q,3] or [B,Q,3]')
 
+        if (self.oracle_adapter is not None and
+                self.oracle_adapter.adapts_reference):
+            reference_points = self.oracle_adapter.adapt_reference(
+                reference_points, query_embeds, rig_embedding)
+            query_embeds = self.query_embedding(
+                pos2posemb3d(reference_points))
+        if (self.oracle_adapter is not None and
+                self.oracle_adapter.adapts_query):
+            query_embeds = self.oracle_adapter.adapt_query(
+                query_embeds, rig_embedding)
+
         urope_query_points = None
         urope_key_points = None
         if self.with_urope:
@@ -600,6 +645,13 @@ class PETRHead(AnchorFreeHead):
             assert reference.shape[-1] == 3
             outputs_class = self.cls_branches[lvl](outs_dec[lvl])
             tmp = self.reg_branches[lvl](outs_dec[lvl])
+
+            if (self.oracle_adapter is not None and
+                    self.oracle_adapter.adapts_output):
+                output_delta = self.oracle_adapter.output_delta(
+                    outs_dec[lvl], rig_embedding)
+                tmp[..., 0:2] += output_delta[..., 0:2]
+                tmp[..., 4:5] += output_delta[..., 2:3]
 
             tmp[..., 0:2] += reference[..., 0:2]
             tmp[..., 0:2] = tmp[..., 0:2].sigmoid()

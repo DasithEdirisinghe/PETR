@@ -1,0 +1,39 @@
+#!/bin/bash
+#PBS -N petr_anchor_analysis
+#PBS -l select=1:ncpus=8:ngpus=1:mem=64gb
+#PBS -l walltime=12:00:00
+#PBS -j oe
+
+set -euo pipefail
+
+PETR_ROOT=/mnt/hpccs01/home/n12893251/dasith_ws/dev_ws/PETR
+cd "$PETR_ROOT"
+
+source /home/n12893251/miniconda3/etc/profile.d/conda.sh
+conda activate petr
+
+CONFIG=${CONFIG:-projects/configs/petr/petr_r50dcn_gridmask_p4_nuscenes_local.py}
+CHECKPOINT=${CHECKPOINT:-ckpts/petr_r50dcn_gridmask_p4_epoch_24.pth}
+NUM_SAMPLES=${NUM_SAMPLES:-500}
+SEED=${SEED:-0}
+OUTPUT_DIR=${OUTPUT_DIR:-experiments/anchor_analysis/outputs}
+RUN_SANITY=${RUN_SANITY:-1}
+
+test -f "$CONFIG"
+test -f "$CHECKPOINT"
+test -f data/nuscenes/nuscenes_infos_temporal_val.pkl
+
+if [ "$RUN_SANITY" = "1" ]; then
+  python experiments/anchor_analysis/analyze.py \
+    --config "$CONFIG" \
+    --checkpoint "$CHECKPOINT" \
+    --sanity-only \
+    --output-dir experiments/anchor_analysis/outputs_sanity
+fi
+
+python experiments/anchor_analysis/analyze.py \
+  --config "$CONFIG" \
+  --checkpoint "$CHECKPOINT" \
+  --num-samples "$NUM_SAMPLES" \
+  --seed "$SEED" \
+  --output-dir "$OUTPUT_DIR"

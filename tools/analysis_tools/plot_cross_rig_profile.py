@@ -21,6 +21,8 @@ def parse_args():
     parser.add_argument("output", type=Path)
     parser.add_argument("--label", default="PCCR-reported PETR")
     parser.add_argument("--title")
+    parser.add_argument("--train-rigs", nargs="+", help="Rigs included in training; defaults to trained_on in the result")
+    parser.add_argument("--split", default="test", choices=("val", "test"))
     return parser.parse_args()
 
 
@@ -42,8 +44,10 @@ def esc(value):
 def main():
     args = parse_args()
     train_rig, values = load_result(args.result)
-    if train_rig not in RIG_ORDER:
-        raise ValueError("Training rig is not in the plot order: {}".format(train_rig))
+    train_rigs = args.train_rigs or [train_rig]
+    unknown = sorted(set(train_rigs) - set(RIG_ORDER))
+    if unknown:
+        raise ValueError("Training rigs are not in the plot order: {}".format(", ".join(unknown)))
 
     width, height = 1600, 780
     left, right = 115, 55
@@ -73,8 +77,8 @@ def main():
         "</style>",
         '<rect width="100%" height="100%" fill="#ffffff"/>',
         '<text x="{}" y="48" class="title">{}</text>'.format(left, esc(title)),
-        '<text x="{}" y="78" class="subtitle">mAP across camera-rig configurations; the filled marker is the in-domain {} test set</text>'.format(
-            left, esc(train_rig)),
+        '<text x="{}" y="78" class="subtitle">mAP across camera-rig configurations on {} sets; filled markers: {}</text>'.format(
+            left, esc(args.split), esc(", ".join(train_rigs))),
     ]
 
     split_x = (x_pos(5) + x_pos(6)) / 2
@@ -113,14 +117,14 @@ def main():
     for i, value in enumerate(values):
         rig = RIG_ORDER[i]
         x, y = x_pos(i), map_y(value)
-        is_train_rig = rig == train_rig
+        is_train_rig = rig in train_rigs
         fill = highlight if is_train_rig else "#ffffff"
         stroke = highlight if is_train_rig else color
         radius = 8 if is_train_rig else 6.5
         parts.append(
             '<circle cx="{:.2f}" cy="{:.2f}" r="{}" fill="{}" stroke="{}" stroke-width="4"><title>{}: {:.2f}% mAP{}</title></circle>'.format(
                 x, y, radius, fill, stroke, esc(rig), value,
-                " (in-domain)" if is_train_rig else ""))
+                " (training rig)" if is_train_rig else ""))
         label_y = y - 14 if value >= 0.8 else y - 12
         parts.append(
             '<text x="{:.2f}" y="{:.2f}" text-anchor="middle" class="value" fill="{}">{:.2f}</text>'.format(

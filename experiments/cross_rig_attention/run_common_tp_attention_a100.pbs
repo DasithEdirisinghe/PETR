@@ -1,0 +1,66 @@
+#!/bin/bash -l
+#PBS -N petr_common_tp_attn
+#PBS -l select=1:ncpus=12:ngpus=1:mem=64GB:gpu_id=A100
+#PBS -l walltime=24:00:00
+#PBS -m abe
+#PBS -j oe
+
+set -euo pipefail
+
+conda activate petr
+
+PETR_DIR="${PETR_DIR:-/mnt/hpccs01/home/n12893251/dasith_ws/dev_ws/PETR}"
+cd "$PETR_DIR"
+export PYTHONPATH="$PETR_DIR:${PYTHONPATH:-}"
+
+DEVICE="${DEVICE:-cuda:0}"
+SMOKE_FRAMES="${SMOKE_FRAMES:-5}"
+OUTPUT_DIR="${OUTPUT_DIR:-$PETR_DIR/experiments/cross_rig_attention/output/r1f_val/common_tp_attention}"
+
+if [[ "${SMOKE_ONLY:-0}" == "1" && "$SMOKE_FRAMES" == "0" ]]; then
+    echo "SMOKE_ONLY=1 requires SMOKE_FRAMES > 0" >&2
+    exit 1
+fi
+
+for required_file in \
+    data/pccr/R1-f/R1-f_infos_val.pkl \
+    results/petr_r50dcn_gridmask_p4_800x320_pccr/R1/latest.pth \
+    results/petr_r50dcn_gridmask_p4_800x320_pccr/R1-f/latest.pth \
+    experiments/cross_rig_attention/output/r1f_val/car_ap_rank_audit/ranked_car_predictions.csv \
+    experiments/cross_rig_attention/output/r1f_val/car_ap_rank_audit/summary.json \
+    experiments/cross_rig_attention/output/r1f_val/R1/formatted/results_pccr.json \
+    experiments/cross_rig_attention/output/r1f_val/R1-f/formatted/results_pccr.json; do
+    if [[ ! -s "$required_file" ]]; then
+        echo "Required input is missing or empty: $required_file" >&2
+        exit 1
+    fi
+done
+
+echo "PBS job: ${PBS_JOBID:-unknown}"
+echo "Host: $(hostname)"
+echo "PETR directory: $PETR_DIR"
+echo "Output directory: $OUTPUT_DIR"
+nvidia-smi
+
+if [[ "$SMOKE_FRAMES" != "0" ]]; then
+    echo "Validating query mapping on $SMOKE_FRAMES cohort frames."
+    python experiments/cross_rig_attention/audit_common_tp_attention.py \
+        --device "$DEVICE" --max-frames "$SMOKE_FRAMES" \
+        --output-dir "$OUTPUT_DIR"
+fi
+
+if [[ "${SMOKE_ONLY:-0}" == "1" ]]; then
+    test -s "$OUTPUT_DIR/per_common_tp.csv"
+    test -s "$OUTPUT_DIR/summary.json"
+    echo "Smoke-only run completed successfully. Submit without SMOKE_ONLY for the full cohort."
+    exit 0
+fi
+
+echo "Running the full, resumable common-TP attention audit."
+python experiments/cross_rig_attention/audit_common_tp_attention.py \
+    --device "$DEVICE" --output-dir "$OUTPUT_DIR"
+
+test -s "$OUTPUT_DIR/per_common_tp.csv"
+test -s "$OUTPUT_DIR/summary.json"
+test -s "$OUTPUT_DIR/common_tp_geometry_attention.svg"
+echo "Completed: $OUTPUT_DIR/common_tp_geometry_attention.svg"

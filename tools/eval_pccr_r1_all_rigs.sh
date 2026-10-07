@@ -45,8 +45,8 @@ if [[ ! "$MODEL_NAME" =~ ^[A-Za-z0-9._-]+$ ]]; then
     echo "MODEL_NAME must contain only letters, numbers, dot, underscore, or hyphen" >&2
     exit 1
 fi
-if [[ ! "$TRAIN_RIG" =~ ^R[0-9]+$ ]]; then
-    echo "TRAIN_RIG must look like R1, R2, etc.: $TRAIN_RIG" >&2
+if [[ ! "$TRAIN_RIG" =~ ^R[0-9]+(-[A-Za-z0-9]+)?$ ]]; then
+    echo "TRAIN_RIG must look like R1, R1-f, R1-c6, etc.: $TRAIN_RIG" >&2
     exit 1
 fi
 if [[ "$SKIP_COMPLETED" != "0" && "$SKIP_COMPLETED" != "1" ]]; then
