@@ -1,0 +1,32 @@
+#!/bin/bash -l
+#PBS -N petr_ray_v2_audit
+#PBS -P FPZSJW8432
+#PBS -l select=1:ncpus=12:ngpus=1:mem=64GB:gpu_id=A100
+#PBS -l walltime=03:00:00
+#PBS -r n
+#PBS -m abe
+#PBS -j oe
+
+set -euo pipefail
+conda activate petr
+
+PETR_DIR=${PETR_DIR:-/home/n12893251/dasith_ws/dev_ws/PETR}
+cd "$PETR_DIR"
+export PYTHONPATH="$PETR_DIR:${PYTHONPATH:-}"
+export OMP_NUM_THREADS=4
+
+CONFIG=projects/configs/petr/petr_r50dcn_gridmask_p4_ray_rule_decoder_heads_only_v6.py
+CHECKPOINT=results/petr_r50dcn_gridmask_p4_nuscenes_fresh_2gpu_global_batch8/epoch_24.pth
+OUTPUT_DIR=results/petr_r50dcn_gridmask_p4_rule_v2_assignment_audit
+MAX_BATCHES=${MAX_BATCHES:-20}
+
+test -f "$CONFIG"
+test -f "$CHECKPOINT"
+test -f data/nuscenes/nuscenes_infos_temporal_train.pkl
+test -d data/nuscenes/samples
+test -d data/nuscenes/v1.0-trainval
+test -f ../mmdetection3d/configs/_base_/datasets/nus-3d.py
+
+python experiments/nuscnes_exp/pedestrian_neighbor_trace/test_rule_v2_smoke.py
+python experiments/nuscnes_exp/pedestrian_neighbor_trace/audit_rule_v2_assignments.py \
+    --config "$CONFIG" --max-batches "$MAX_BATCHES" --output-dir "$OUTPUT_DIR"

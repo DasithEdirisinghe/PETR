@@ -1,0 +1,44 @@
+#!/bin/bash -l
+#PBS -N petr_ray_v4_bs8
+#PBS -P FPZSJW8432
+#PBS -l select=1:ncpus=24:ngpus=2:mem=120GB:gpu_id=A100
+#PBS -l walltime=12:00:00
+#PBS -m abe
+#PBS -j oe
+
+set -euo pipefail
+conda activate petr
+
+PETR_DIR=${PETR_DIR:-/home/n12893251/dasith_ws/dev_ws/PETR}
+cd "$PETR_DIR"
+export PYTHONPATH="$PETR_DIR:${PYTHONPATH:-}"
+export OMP_NUM_THREADS=4
+
+CONFIG=projects/configs/petr/petr_r50dcn_gridmask_p4_ray_rule_decoder_heads_only_v4.py
+CHECKPOINT=results/petr_r50dcn_gridmask_p4_nuscenes_fresh_2gpu_global_batch8/epoch_24.pth
+OUTPUT_DIR=results/petr_r50dcn_gridmask_p4_ray_rule_decoder_heads_only_v4
+SEED=${SEED:-0}
+PORT=${PORT:-29539}
+
+test -f "$CONFIG"
+test -f "$CHECKPOINT"
+test -f ckpts/resnet50_msra-5891d200.pth
+test -f data/nuscenes/nuscenes_infos_temporal_train.pkl
+test -f data/nuscenes/nuscenes_infos_temporal_val.pkl
+test -d data/nuscenes/samples
+test -d data/nuscenes/v1.0-trainval
+test -f ../mmdetection3d/configs/_base_/datasets/nus-3d.py
+
+python experiments/nuscnes_exp/pedestrian_neighbor_trace/test_ray_rule_smoke.py
+
+mkdir -p "$OUTPUT_DIR"
+echo "PBS job: ${PBS_JOBID:-unknown}"
+echo "Config: $CONFIG"
+echo "Checkpoint: $CHECKPOINT"
+echo "Output: $OUTPUT_DIR"
+echo "Batch: 2 A100 GPUs x 4 samples/GPU = global batch size 8"
+echo "Ray-rule weight: 0.075; epochs: 4; evaluation and diagnostics every epoch"
+nvidia-smi
+
+PORT="$PORT" bash tools/dist_train.sh \
+    "$CONFIG" 2 --work-dir "$OUTPUT_DIR" --seed "$SEED"

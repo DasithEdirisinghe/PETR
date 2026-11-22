@@ -1,0 +1,15 @@
+#!/bin/bash -l
+#PBS -N petr_r50_train_infer
+#PBS -P FPZSJW8432
+#PBS -l select=1:ncpus=12:ngpus=1:mem=80GB:gpu_id=A100
+#PBS -l walltime=24:00:00
+#PBS -j oe
+
+set -euo pipefail
+PETR_DIR=/mnt/hpccs01/home/n12893251/dasith_ws/dev_ws/PETR
+cd "$PETR_DIR"
+export CONDA_ENV="${CONDA_ENV:-petr}"
+export GPUS=1
+export OMP_NUM_THREADS=4
+bash experiments/nuscnes_exp/train_split_diagnostics/run_petr_r50_train_inference.sh
+

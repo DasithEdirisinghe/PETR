@@ -97,7 +97,9 @@ Outputs are written below `experiments/query_trace/outputs/<sample-token>/`:
 Component impact uses every valid image token. For each component, the script
 computes the Jensen-Shannon divergence between full attention and attention
 with that logit component removed, averages it across heads, and normalizes the
-six impacts to 100% independently for each query and layer.
+six impacts to 100% independently for each query and layer. Q-projection bias
+is folded into `H`, and K-projection bias is folded into `X`, so the named
+projected components reconstruct the actual biased Q/K projections.
 
 ## Optional per-head camera-attention visualization
 
@@ -260,3 +262,9 @@ The CSV reports the query ID, matched GT ID and class, classification result,
 confidence, and BEV localization error. This supports choosing a correctly
 localized object, a failed object, or both before performing the expensive
 layerwise trace.
+
+For the full three-condition failure analysis—including an independently
+matched R1-f query, the fixed R1 query, GT-ray discrimination, directional
+term utility, and paired report figures—use
+`experiments/cross_rig_attention/run_paired_trace.py` as documented in
+`experiments/cross_rig_attention/README.md`.

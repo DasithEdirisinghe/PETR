@@ -20,6 +20,8 @@ from mmdet3d.core import (CameraInstance3DBoxes,LiDARInstance3DBoxes, bbox3d2res
                           show_multi_modality_result)
 from mmdet3d.models.detectors.mvx_two_stage import MVXTwoStageDetector
 from projects.mmdet3d_plugin.models.utils.grid_mask import GridMask
+from projects.mmdet3d_plugin.models.utils.parameter_freeze import (
+    configure_parameter_freeze, enforce_frozen_module_eval)
 
 
 @DETECTORS.register_module()
@@ -41,7 +43,8 @@ class Petr3D(MVXTwoStageDetector):
                  img_rpn_head=None,
                  train_cfg=None,
                  test_cfg=None,
-                 pretrained=None):
+                 pretrained=None,
+                 parameter_freeze_cfg=None):
         super(Petr3D, self).__init__(pts_voxel_layer, pts_voxel_encoder,
                              pts_middle_encoder, pts_fusion_layer,
                              img_backbone, pts_backbone, img_neck, pts_neck,
@@ -55,6 +58,18 @@ class Petr3D(MVXTwoStageDetector):
             for name, parameter in self.named_parameters():
                 parameter.requires_grad = (
                     name.startswith('pts_bbox_head.oracle_adapter.'))
+        self.parameter_freeze_state = None
+        if parameter_freeze_cfg is not None:
+            if getattr(self.pts_bbox_head, 'oracle_adapter', None) is not None:
+                raise ValueError('parameter_freeze_cfg cannot be combined with oracle_adapter')
+            self.parameter_freeze_state = configure_parameter_freeze(
+                self, parameter_freeze_cfg)
+
+    def train(self, mode=True):
+        result = super(Petr3D, self).train(mode)
+        if mode and getattr(self, 'parameter_freeze_state', None) is not None:
+            enforce_frozen_module_eval(self, self.parameter_freeze_state)
+        return result
 
     def extract_img_feat(self, img, img_metas):
         """Extract features of images."""
@@ -121,7 +136,11 @@ class Petr3D(MVXTwoStageDetector):
         else:
             outs = self.pts_bbox_head(pts_feats, img_metas)
         loss_inputs = [gt_bboxes_3d, gt_labels_3d, outs]
-        losses = self.pts_bbox_head.loss(*loss_inputs)
+        if (getattr(self.pts_bbox_head, 'ray_rule_cfg', None) is not None or
+                getattr(self.pts_bbox_head, 'rule_v2_cfg', None) is not None):
+            losses = self.pts_bbox_head.loss(*loss_inputs, img_metas=img_metas)
+        else:
+            losses = self.pts_bbox_head.loss(*loss_inputs)
 
         return losses
 

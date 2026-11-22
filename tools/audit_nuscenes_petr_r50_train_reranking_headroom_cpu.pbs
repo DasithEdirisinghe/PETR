@@ -1,0 +1,38 @@
+#!/bin/bash -l
+#PBS -N petr_train_rank_oracle
+#PBS -P FPZSJW8432
+#PBS -l select=1:ncpus=16:mem=64GB
+#PBS -l walltime=12:00:00
+#PBS -m abe
+#PBS -j oe
+
+set -euo pipefail
+conda activate petr
+
+PETR_DIR=${PETR_DIR:-/home/n12893251/dasith_ws/dev_ws/PETR}
+cd "$PETR_DIR"
+export PYTHONPATH="$PETR_DIR:${PYTHONPATH:-}"
+export OMP_NUM_THREADS=8
+
+DATA_ROOT=${DATA_ROOT:-"$PETR_DIR/../RoboBEV/data/sets/nuscenes"}
+RESULTS_JSON=${RESULTS_JSON:-experiments/nuscnes_exp/train_split_diagnostics/outputs/petr_r50/train/inference/formatted/pts_bbox/results_nusc.json}
+OUTPUT_DIR=${OUTPUT_DIR:-experiments/nuscnes_exp/train_split_diagnostics/outputs/petr_r50/train/oracle_ap}
+
+test -s "$RESULTS_JSON"
+test -d "$DATA_ROOT/v1.0-trainval"
+
+echo "Prediction file: $RESULTS_JSON"
+echo "nuScenes root: $DATA_ROOT"
+echo "Output: $OUTPUT_DIR"
+echo "This is a GT-informed fixed-box ranking oracle on the train split."
+echo "Only frames present in the prediction file are included in the AP analysis."
+
+python experiments/nuscnes_exp/pedestrian_neighbor_trace/all_class_reranking_oracle.py \
+    --results-json "$RESULTS_JSON" \
+    --data-root "$DATA_ROOT" \
+    --output-dir "$OUTPUT_DIR" \
+    --eval-set train \
+    --restrict-to-result-tokens
+
+test -s "$OUTPUT_DIR/summary.json"
+echo "Completed train ranking headroom: $OUTPUT_DIR/summary.json"

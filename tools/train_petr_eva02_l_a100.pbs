@@ -1,0 +1,15 @@
+#!/bin/bash -l
+#PBS -N petr_eva02_l_p4_bs8
+#PBS -P FPZSJW8432
+#PBS -l select=1:ncpus=24:ngpus=2:mem=120GB:gpu_id=A100
+#PBS -l walltime=48:00:00
+#PBS -j oe
+
+set -euo pipefail
+PETR_DIR=/mnt/hpccs01/home/n12893251/dasith_ws/dev_ws/PETR
+cd "$PETR_DIR"
+export GPUS=2
+export OMP_NUM_THREADS=4
+export CONFIG=projects/configs/petr/petr_eva02_l_p4_800x320_nuscenes_global_batch_8.py
+export WORK_DIR=results/petr_eva02_l_p4_800x320_nuscenes_global_batch_8
+bash tools/train_petr_eva02_l.sh

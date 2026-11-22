@@ -1,0 +1,11 @@
+#!/bin/bash -l
+#PBS -N petr_eva02_e16_iou
+#PBS -P FPZSJW8432
+#PBS -l select=1:ncpus=24:ngpus=2:mem=120GB:gpu_id=A100
+#PBS -l walltime=24:00:00
+#PBS -j oe
+
+set -euo pipefail
+cd /mnt/hpccs01/home/n12893251/dasith_ws/dev_ws/PETR
+export GPUS=2
+bash tools/eval_petr_eva02_epoch16_iou_oracle.sh

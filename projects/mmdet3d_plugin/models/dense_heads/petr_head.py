@@ -119,6 +119,8 @@ class PETRHead(AnchorFreeHead):
                  urope_with_multiview_pe=False,
                  lidar_oracle_cfg=None,
                  oracle_adapter=None,
+                 ray_rule_cfg=None,
+                 rule_v2_cfg=None,
                  **kwargs):
         # NOTE here use `AnchorFreeHead` instead of `TransformerHead`,
         # since it brings inconvenience when the initialization of
@@ -133,6 +135,14 @@ class PETRHead(AnchorFreeHead):
             self.code_weights = [1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 0.2, 0.2]
         self.code_weights = self.code_weights[:self.code_size]
         self.bg_cls_weight = 0
+        self.ray_rule_cfg = dict(ray_rule_cfg) if ray_rule_cfg is not None else None
+        self.rule_v2_cfg = dict(rule_v2_cfg) if rule_v2_cfg is not None else None
+        self.rule_v2_diagnostics_grad_sample = False
+        self.rule_v2_last_examples = []
+        if self.ray_rule_cfg is not None and self.rule_v2_cfg is not None:
+            raise ValueError('ray_rule_cfg and rule_v2_cfg are mutually exclusive')
+        self.ray_rule_diagnostics_active = False
+        self.ray_rule_diagnostics_grad_sample = False
         self.sync_cls_avg_factor = sync_cls_avg_factor
         class_weight = loss_cls.get('class_weight', None)
         if class_weight is not None and (self.__class__ is PETRHead):
@@ -675,6 +685,8 @@ class PETRHead(AnchorFreeHead):
             'enc_cls_scores': None,
             'enc_bbox_preds': None, 
         }
+        if self.ray_rule_diagnostics_grad_sample and self.training:
+            outs['ray_rule_decoder_features'] = outs_dec
         return outs
 
     def _get_target_single(self,
@@ -682,7 +694,8 @@ class PETRHead(AnchorFreeHead):
                            bbox_pred,
                            gt_labels,
                            gt_bboxes,
-                           gt_bboxes_ignore=None):
+                           gt_bboxes_ignore=None,
+                           assign_result=None):
         """"Compute regression and classification targets for one image.
         Outputs from a single decoder layer of a single feature level are used.
         Args:
@@ -709,8 +722,9 @@ class PETRHead(AnchorFreeHead):
 
         num_bboxes = bbox_pred.size(0)
         # assigner and sampler
-        assign_result = self.assigner.assign(bbox_pred, cls_score, gt_bboxes,
-                                             gt_labels, gt_bboxes_ignore)
+        if assign_result is None:
+            assign_result = self.assigner.assign(bbox_pred, cls_score, gt_bboxes,
+                                                 gt_labels, gt_bboxes_ignore)
         sampling_result = self.sampler.sample(assign_result, bbox_pred,
                                               gt_bboxes)
         pos_inds = sampling_result.pos_inds
@@ -739,7 +753,8 @@ class PETRHead(AnchorFreeHead):
                     bbox_preds_list,
                     gt_bboxes_list,
                     gt_labels_list,
-                    gt_bboxes_ignore_list=None):
+                    gt_bboxes_ignore_list=None,
+                    assign_results_list=None):
         """"Compute regression and classification targets for a batch image.
         Outputs from a single decoder layer of a single feature level are used.
         Args:
@@ -775,11 +790,14 @@ class PETRHead(AnchorFreeHead):
         gt_bboxes_ignore_list = [
             gt_bboxes_ignore_list for _ in range(num_imgs)
         ]
+        if assign_results_list is None:
+            assign_results_list = [None] * num_imgs
 
         (labels_list, label_weights_list, bbox_targets_list,
          bbox_weights_list, pos_inds_list, neg_inds_list) = multi_apply(
              self._get_target_single, cls_scores_list, bbox_preds_list,
-             gt_labels_list, gt_bboxes_list, gt_bboxes_ignore_list)
+             gt_labels_list, gt_bboxes_list, gt_bboxes_ignore_list,
+             assign_results_list)
         num_total_pos = sum((inds.numel() for inds in pos_inds_list))
         num_total_neg = sum((inds.numel() for inds in neg_inds_list))
         return (labels_list, label_weights_list, bbox_targets_list,
@@ -790,7 +808,8 @@ class PETRHead(AnchorFreeHead):
                     bbox_preds,
                     gt_bboxes_list,
                     gt_labels_list,
-                    gt_bboxes_ignore_list=None):
+                    gt_bboxes_ignore_list=None,
+                    assign_results_list=None):
         """"Loss function for outputs from a single decoder layer of a single
         feature level.
         Args:
@@ -813,8 +832,9 @@ class PETRHead(AnchorFreeHead):
         cls_scores_list = [cls_scores[i] for i in range(num_imgs)]
         bbox_preds_list = [bbox_preds[i] for i in range(num_imgs)]
         cls_reg_targets = self.get_targets(cls_scores_list, bbox_preds_list,
-                                           gt_bboxes_list, gt_labels_list, 
-                                           gt_bboxes_ignore_list)
+                                           gt_bboxes_list, gt_labels_list,
+                                           gt_bboxes_ignore_list,
+                                           assign_results_list)
         (labels_list, label_weights_list, bbox_targets_list, bbox_weights_list,
          num_total_pos, num_total_neg) = cls_reg_targets
         labels = torch.cat(labels_list, 0)
@@ -858,7 +878,8 @@ class PETRHead(AnchorFreeHead):
              gt_bboxes_list,
              gt_labels_list,
              preds_dicts,
-             gt_bboxes_ignore=None):
+             gt_bboxes_ignore=None,
+             img_metas=None):
         """"Loss function.
         Args:
             gt_bboxes_list (list[Tensor]): Ground truth bboxes for each image
@@ -905,11 +926,31 @@ class PETRHead(AnchorFreeHead):
         all_gt_bboxes_ignore_list = [
             gt_bboxes_ignore for _ in range(num_dec_layers)
         ]
+        rule_v2_prepared = []
+        rule_assignments = [None] * num_dec_layers
+        if self.rule_v2_cfg is not None:
+            if img_metas is None:
+                raise ValueError('rule_v2_cfg requires training img_metas')
+            from .ray_rule_v2 import prepare_rule_v2_layer
+            matching = self.rule_v2_cfg.get('matching', 'original')
+            if matching not in ('original', 'rule'):
+                raise ValueError('rule_v2_cfg.matching must be original or rule')
+            for layer in range(num_dec_layers):
+                prepared = prepare_rule_v2_layer(
+                    all_cls_scores[layer], all_bbox_preds[layer],
+                    gt_bboxes_list, gt_labels_list, img_metas,
+                    self.assigner, self.rule_v2_cfg)
+                rule_v2_prepared.append(prepared)
+                rule_assignments[layer] = prepared[0 if matching == 'rule' else 1]
+            self.rule_v2_last_examples = [
+                dict(example, decoder_layer=layer)
+                for layer, prepared in enumerate(rule_v2_prepared)
+                for example in prepared[6]]
 
         losses_cls, losses_bbox = multi_apply(
             self.loss_single, all_cls_scores, all_bbox_preds,
             all_gt_bboxes_list, all_gt_labels_list, 
-            all_gt_bboxes_ignore_list)
+            all_gt_bboxes_ignore_list, rule_assignments)
 
         loss_dict = dict()
         # loss of proposal generated from encode feature map.
@@ -935,6 +976,131 @@ class PETRHead(AnchorFreeHead):
             loss_dict[f'd{num_dec_layer}.loss_cls'] = loss_cls_i
             loss_dict[f'd{num_dec_layer}.loss_bbox'] = loss_bbox_i
             num_dec_layer += 1
+        if self.rule_v2_cfg is not None:
+            from .ray_rule_v2 import rule_v2_rank_loss
+            rank_losses = []
+            totals = {}
+            for layer, (_, _, positives, duplicates, unsupported, stats, _) in enumerate(
+                    rule_v2_prepared):
+                if self.rule_v2_cfg.get('enable_ranking', True):
+                    rank_loss, rank_stats = rule_v2_rank_loss(
+                        all_cls_scores[layer], positives, duplicates, unsupported,
+                        self.rule_v2_cfg)
+                else:
+                    rank_loss = all_cls_scores[layer].sum() * 0
+                    rank_stats = {'ranking_pairs': 0.0, 'ranking_inversions': 0.0}
+                rank_losses.append(rank_loss)
+                for name, value in dict(stats, **rank_stats).items():
+                    totals[name] = totals.get(name, 0.0) + value
+            loss_dict['loss_rule_v2_rank'] = (
+                torch.stack(rank_losses).sum() *
+                float(self.rule_v2_cfg.get('loss_weight', 0.05)))
+            for name, value in totals.items():
+                loss_dict['rule_v2_diag_' + name] = all_cls_scores.new_tensor(value)
+            loss_dict['rule_v2_diag_rank_value'] = (
+                loss_dict['loss_rule_v2_rank'].detach())
+            loss_dict['rule_v2_diag_cls_value'] = torch.stack(losses_cls).sum().detach()
+            loss_dict['rule_v2_diag_bbox_value'] = torch.stack(losses_bbox).sum().detach()
+            if self.rule_v2_diagnostics_grad_sample:
+                cls_gradient = torch.autograd.grad(
+                    torch.stack(losses_cls).sum(), all_cls_scores,
+                    retain_graph=True)[0].detach()
+                rank_gradient = torch.autograd.grad(
+                    loss_dict['loss_rule_v2_rank'], all_cls_scores,
+                    retain_graph=True)[0].detach()
+                combined = cls_gradient + rank_gradient
+                gradient_stats = {
+                    'positive_gradient_count': 0.0,
+                    'positive_base_wrong': 0.0,
+                    'positive_combined_wrong': 0.0,
+                    'negative_gradient_count': 0.0,
+                    'negative_base_wrong': 0.0,
+                    'negative_combined_wrong': 0.0,
+                }
+                for layer, (_, _, positives, duplicates, unsupported, _, _) in enumerate(
+                        rule_v2_prepared):
+                    for name, entries, expected_sign in (
+                            ('positive', positives, -1),
+                            ('negative', list(dict.fromkeys(duplicates + unsupported)), 1)):
+                        if not entries:
+                            continue
+                        index = tuple(torch.tensor([e[k] for e in entries],
+                                                   device=all_cls_scores.device)
+                                      for k in range(3))
+                        base = cls_gradient[(layer,) + index]
+                        total_gradient = combined[(layer,) + index]
+                        gradient_stats[name + '_gradient_count'] += len(entries)
+                        gradient_stats[name + '_base_wrong'] += float(
+                            ((base * expected_sign) <= 0).sum())
+                        gradient_stats[name + '_combined_wrong'] += float(
+                            ((total_gradient * expected_sign) <= 0).sum())
+                for name, value in gradient_stats.items():
+                    loss_dict['rule_v2_diag_' + name] = all_cls_scores.new_tensor(value)
+        if self.ray_rule_cfg is not None:
+            if img_metas is None:
+                raise ValueError('ray_rule_cfg requires training img_metas')
+            from .ray_rule_loss import ray_rule_layer_loss
+            rule_losses = []
+            diagnostic_totals = {}
+            rule_cfg = dict(self.ray_rule_cfg)
+            rule_cfg['collect_diagnostics'] = self.ray_rule_diagnostics_active
+            for layer in range(num_dec_layers):
+                rule_loss, stats = ray_rule_layer_loss(
+                    all_cls_scores[layer], all_bbox_preds[layer],
+                    gt_bboxes_list, gt_labels_list, img_metas,
+                    self.assigner, rule_cfg)
+                rule_losses.append(rule_loss)
+                if self.ray_rule_diagnostics_active:
+                    for name, value in stats.items():
+                        diagnostic_totals[name] = diagnostic_totals.get(name, 0) + value
+            loss_dict['loss_ray_rule'] = (
+                torch.stack(rule_losses).sum() *
+                float(self.ray_rule_cfg.get('loss_weight', 0.05)))
+            if self.ray_rule_diagnostics_active:
+                for name, value in diagnostic_totals.items():
+                    loss_dict['ray_diag_' + name] = all_cls_scores.new_tensor(float(value))
+                cls_total = torch.stack(losses_cls).sum()
+                bbox_total = torch.stack(losses_bbox).sum()
+                loss_dict['ray_diag_cls_value'] = cls_total.detach()
+                loss_dict['ray_diag_bbox_value'] = bbox_total.detach()
+                loss_dict['ray_diag_rule_value'] = loss_dict['loss_ray_rule'].detach()
+                loss_dict['ray_diag_rule_outer_weight'] = all_cls_scores.new_tensor(
+                    float(self.ray_rule_cfg.get('loss_weight', 0.05)))
+                features = preds_dicts.get('ray_rule_decoder_features')
+                if self.ray_rule_diagnostics_grad_sample and features is not None:
+                    decoder_grads = {}
+                    for name, term in (('cls', cls_total), ('bbox', bbox_total),
+                                       ('rule', loss_dict['loss_ray_rule'])):
+                        gradient = torch.autograd.grad(
+                            term, features, retain_graph=True,
+                            allow_unused=True)[0]
+                        decoder_grads[name] = gradient
+                        loss_dict['ray_diag_grad_' + name] = (
+                            gradient.detach().float().norm() if gradient is not None
+                            else all_cls_scores.new_zeros(()))
+                    for other in ('cls', 'bbox'):
+                        rule_grad = decoder_grads['rule']
+                        other_grad = decoder_grads[other]
+                        if rule_grad is None or other_grad is None:
+                            cosine = all_cls_scores.new_zeros(())
+                        else:
+                            rule_flat = rule_grad.detach().float().flatten()
+                            other_flat = other_grad.detach().float().flatten()
+                            cosine = torch.dot(rule_flat, other_flat) / (
+                                rule_flat.norm() * other_flat.norm()).clamp(min=1e-12)
+                        loss_dict['ray_diag_grad_cos_rule_' + other] = cosine
+                    cls_logit_grad = torch.autograd.grad(
+                        cls_total, all_cls_scores, retain_graph=True)[0].detach()
+                    rule_logit_grad = torch.autograd.grad(
+                        loss_dict['loss_ray_rule'], all_cls_scores,
+                        retain_graph=True)[0].detach()
+                    selected = rule_logit_grad.abs() > 1e-12
+                    opposed = selected & ((cls_logit_grad * rule_logit_grad) < 0)
+                    loss_dict['ray_diag_logit_opposition_fraction'] = (
+                        opposed.sum().float() / selected.sum().clamp(min=1))
+                    loss_dict['ray_diag_logit_rule_wins_fraction'] = (
+                        (opposed & (rule_logit_grad.abs() > cls_logit_grad.abs()))
+                        .sum().float() / opposed.sum().clamp(min=1))
         return loss_dict
 
     @force_fp32(apply_to=('preds_dicts'))
